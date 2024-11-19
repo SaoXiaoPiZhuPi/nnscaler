@@ -1,0 +1,6 @@
+build/
+examples/
+nnscaler.egg-info/
+*.log
+*.so
+*.whl
