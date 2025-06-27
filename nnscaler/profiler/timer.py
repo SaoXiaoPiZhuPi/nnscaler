@@ -38,6 +38,7 @@ class CudaTimer:
             self.field_data = dict()
             self.enabled = enable
             self.predefined = predefined
+            self.count=0
     
     instance = None
 

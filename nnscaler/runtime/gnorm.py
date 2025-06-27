@@ -142,8 +142,9 @@ def prepare_for_grad_clip(cube_model: 'CubeModule', is_zero: bool) -> Dict[int, 
     for seq, params_info in enumerate(params_info_for_gnorm):
         # params_info is ParamsInfo, which is defined in this file
         assert isinstance(params_info.ranks, tuple), f'ranks {params_info.ranks} should be tuple'
-        for name, param in zip(params_info.param_names, params_info.params):
+        for param in params_info.params:
             assert param.requires_grad
+        for name in params_info.param_names:
             tid = cube_model.tid_of_param_name(name)
             tid2ranks[tid] = params_info.ranks
             tid2info_list_seq[tid] = seq
@@ -195,6 +196,7 @@ def _multi_tensor_total_norm(grads, chunk_size=2048 * 32) -> torch.Tensor:
         if cur_device_grads is None:
             cur_device_grads = []
             per_device_grads[device] = cur_device_grads
+        # cur_device_grads.append(grad.to(torch.float32))
         cur_device_grads.append(grad)
     for device in per_device_grads.keys():
         cur_device_grads = per_device_grads[device]

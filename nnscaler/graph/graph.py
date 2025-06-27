@@ -15,12 +15,8 @@ import logging
 import copy
 import dill
 import hashlib
-import networkx as nx
-import numpy as np
-import matplotlib.pyplot as plt
-from collections import deque,defaultdict
 
-from nnscaler.ir.adapter import IRAdapter, IRWeightReducer
+from nnscaler.ir.adapter import IRAdapter
 from nnscaler.ir.cten import IRTensor, IRCell, IRObject
 from nnscaler.ir.unique import IDGenerator
 from nnscaler.ir.operator import IRBpOperation, IRFwOperation, IRDataOperation
@@ -52,6 +48,9 @@ class IRGraph(IRSegment):
         super().__init__(nodes, inputs, outputs, module_name)
 
         self._sched = None  # the schedule strategy
+
+        # mesh config of graph
+        self._mesh_size: tuple
 
     @property
     def train(self) -> bool:
@@ -137,10 +136,15 @@ class IRGraph(IRSegment):
         For operators that doesn't need backward, all gradients of their
         input/output tensors will make to None (despite require_grad is True)
 
-        @param loss IRSubTensor: the loss tensor, must be in the output
+        Note grad of input tensors of a IRPyFunc will be None and we will not
+        generate a backward node for IRPyFunc.
+
+        Args:
+            loss (IRSubTensor): the loss tensor, must be in the output
             of current graph. The loss shape should be (1,)
 
-        @return self IRGraph: None
+        Returns:
+            self (IRGraph): updated graph with backward operators
         """
         # set mirror as self
         self._mirror = self
@@ -178,6 +182,7 @@ class IRGraph(IRSegment):
             self.insert(bwop, self.nnodes)
 
         return self
+
     def percur(self, node: IRCell):
         """find Precursor nodes of a given node
         Args:
@@ -223,423 +228,6 @@ class IRGraph(IRSegment):
                 Subsequent_nodes.append(next_nodes)
  
         return Subsequent_nodes
-    
-    def convert_to_nx_graph(self,Bpflag=False,Adapterflag=False,ID_range=None):
-        """Convert a given custom graph structure to a networkx DiGraph.  
-        Args:
-            graph: A custom graph object with methods `nodes()` and `subseq(node)` to retrieve 
-                nodes and the subsequent nodes (dependencies) of a given node.
-            
-        Returns:
-            nx.DiGraph: A directed graph where nodes represent the names of the original nodes, 
-                        and edges represent the dependencies between them.
-        """
-        nx_graph = nx.DiGraph()
-        bp_graph= nx.DiGraph()
-        nodes = self.nodes()
-
-        def get_node_tag(node: IRCell):
-            assert isinstance(node, IRCell), f"node {node} is not IRCell"
-            isbp=False
-            isadapter=False
-            if isinstance(node, IRFwOperation):
-                node_tag=f'FWOp{node.cid}'
-                label=f'{node.name}'
-            elif isinstance(node, IRBpOperation):
-                node_tag=f'BwOp{node.cid}'
-                label=f'{node.mirror.name}'
-                isbp=True
-            elif isinstance(node, IRDataOperation):
-                node_tag=f'DataLoader{node.cid}'
-                label=f'{node.name}'
-            elif isinstance(node, IRAdapter):
-                node_tag=f'Adapter{node.cid}'
-                label=f'{node.name}'
-                isadapter=True
-            elif isinstance(node, IRWeightReducer):
-                node_tag=f'WeightReducer{node.cid}'
-                label=f'{node.name}'
-                isadapter=True
-            else:
-                node_tag=f'PyOp{node.cid}'
-                label=f'{node.name}'
-            return node_tag,label,isbp,isadapter
-
-        for node in nodes:
-            node_tag,label,isbp,isadapter=get_node_tag(node)
-            if isbp and not Bpflag:
-                continue 
-            elif isadapter and not Adapterflag:
-                continue
-            elif ID_range is not None:
-                assert isinstance(ID_range, list) and len(ID_range) == 2, "ID_range must be a list with exactly two elements"
-                assert all(isinstance(x, int) for x in ID_range), "ID_range elements must be integers"
-                if ID_range[0] <= node.cid <= ID_range[1]:
-                    nx_graph.add_node(node_tag,label=label)
-                else:
-                    continue
-            else:
-                nx_graph.add_node(node_tag,label=label)   
-
-            if isbp:
-                bp_graph.add_node(node_tag,label=label)  
-
-            successors = self.subseq(node)
-            for next_nodes in successors:
-                for next_node in next_nodes:
-                    assert isinstance(next_node, IRCell), f"node {node} is not IRCell"
-                    next_node_tag,_,_,_=get_node_tag(next_node)
-                    if node.device and next_node.device:
-                        if node.device==next_node.device:
-                            nx_graph.add_edge(node_tag,next_node_tag) 
-                            if isbp:
-                                bp_graph.add_edge(node_tag,next_node_tag) 
-                        else:
-                            continue
-                    else:
-                        nx_graph.add_edge(node_tag,next_node_tag)
-                        if isbp:
-                                bp_graph.add_edge(node_tag,next_node_tag) 
-            
-            if isinstance(node,IRAdapter):
-                percur_nodes=self.percur(node)
-                subseq_nodes=self.subseq(node)
-                for percurs in percur_nodes:
-                    for percur in percurs:
-                        percur_node_tag,_,_,_=get_node_tag(percur)
-                        for subseqs in subseq_nodes:
-                            for subseq in subseqs:
-                                subseq_node_tag,_,_,_=get_node_tag(subseq)
-                                if nx_graph.has_edge(percur_node_tag, subseq_node_tag):
-                                    nx_graph.remove_edge(percur_node_tag, subseq_node_tag)
-                                if bp_graph.has_edge(percur_node_tag, subseq_node_tag):
-                                    bp_graph.remove_edge(percur_node_tag, subseq_node_tag)
-                                nx_graph.add_edge(percur_node_tag,node_tag)
-                                nx_graph.add_edge(node_tag,subseq_node_tag)
-                                if isinstance(percur_node_tag, IRBpOperation) or isinstance(subseq_node_tag, IRBpOperation):
-                                    bp_graph.add_edge(percur_node_tag,node_tag)
-                                    bp_graph.add_edge(node_tag,subseq_node_tag)
-            # 检查所有自环
-            self_loops = list(nx.selfloop_edges(nx_graph))
-            self_loops_bp=list(nx.selfloop_edges(bp_graph))
-
-            # 如果要移除所有自环
-            nx_graph.remove_edges_from(self_loops)
-            bp_graph.remove_edges_from(self_loops_bp)
-
-
-        return nx_graph,bp_graph
-
-    def find_longest_path(self,graph):
-        """
-        Find the longest path in the graph in topological order, starting from a node with depth 0.
-
-        Args:
-            graph: A directed acyclic graph (DAG).
-
-        Returns:
-            A list of nodes representing the longest path, ordered from start to end.
-        """
-        if graph.number_of_nodes() == 0:
-            raise ValueError("The input graph is empty.")
-        longest_paths = {}
-        predecessors = {}
-
-        # Initialize all nodes' depths as -1 (unvisited)
-        for node in graph.nodes():
-            longest_paths[node] = -1
-
-        # Initialize depths for nodes with no predecessors (indegree 0) as 0
-        for node in graph.nodes():
-            if graph.in_degree(node) == 0:
-                longest_paths[node] = 0
-
-        # Perform topological sorting
-        topological_sorted_nodes = list(nx.topological_sort(graph))
-
-        # Calculate the longest path depth and record predecessors
-        for node in topological_sorted_nodes:
-            for successor in graph.successors(node):
-                if longest_paths[successor] < longest_paths[node] + 1:
-                    longest_paths[successor] = longest_paths[node] + 1
-                    predecessors[successor] = node
-
-        # Find the end of the longest path (node with max depth)
-        end_node = max(longest_paths, key=longest_paths.get)
-
-        # Build the longest path in order from start to end
-        longest_path = []
-        current_node = end_node
-        while current_node in predecessors:
-            longest_path.append(current_node)
-            current_node = predecessors[current_node]
-        longest_path.append(current_node)  # Add the starting node
-
-        return longest_path[::-1]  # Reverse to return path from start to end
-    def assign_coordinates(self,graph):
-        """
-        Assign coordinates to each node in the graph based on the main path along the y-axis,
-        and assign branches on left and right sides to balance the layout.
-        
-        Args:
-            graph: A directed NetworkX graph.
-            longest_path: List of nodes representing the main longest path.
-
-        Returns:
-            node_positions: Dictionary with node as key and (x, y) tuple as value representing its position.
-        """
-        longest_path=self.find_longest_path(graph)
-        print("max depth:",len(longest_path))
-        node_positions = {}
-        branch_counter = {"left": 0, "right": 0}  # To keep track of branches on left and right
-        visited = set()
-        
-        # Step 1: Place main path nodes along the y-axis
-        for depth, node in enumerate(longest_path):
-            y = -depth
-            node_positions[node] = (0, y)  # Main path is centered at x = 0
-            visited.add(node)
-        
-        # Step 2: Explore branches for each node on the main path
-        def explore_branches(current_node, current_depth, direction, is_predecessor=True):
-            """
-            Recursive DFS to place branch nodes either on the left or right based on direction.
-            
-            Args:
-                current_node: The node being explored.
-                current_depth: Current depth level for Y coordinate.
-                direction: "left" or "right" to determine the X coordinate side.
-                is_predecessor: If True, explore predecessors; otherwise, successors.
-            """
-            
-            if direction == "left":
-                x_shift = -1  # Move left
-            else:
-                x_shift = 1   # Move right
-
-            # Get neighbors based on direction
-            neighbors = [
-                neighbor for neighbor in 
-                (graph.predecessors(current_node) if is_predecessor else graph.successors(current_node))
-                if neighbor not in longest_path and neighbor not in visited
-            ]
-
-            # Traverse each neighbor and assign positions
-            for neighbor in neighbors:
-                visited.add(neighbor)
-
-                # Determine new position for the neighbor node
-                if is_predecessor:
-                    y = current_depth + 1  # Predecessors go to the previous layer
-                    # Find leftmost or rightmost x in the previous layer based on direction
-                    prev_layer_xs = [coord[0] for node, coord in node_positions.items() if coord[1] == y and coord[0] * x_shift >= 0]
-                    x = (min(prev_layer_xs) - 1) if direction == "left" else (max(prev_layer_xs) + 1) if prev_layer_xs else x_shift
-                else:
-                    y = current_depth - 1  # Successors go to the next layer
-                    next_layer_xs = [coord[0] for node, coord in node_positions.items() if coord[1] == y and coord[0] * x_shift >= 0]
-                    x = (min(next_layer_xs) - 1) if direction == "left" else (max(next_layer_xs) + 1) if next_layer_xs else x_shift
-                    
-                
-                node_positions[neighbor] = (x, y)
-                
-                # Recursively explore branches from the current neighbor
-                explore_branches(neighbor, y, direction, is_predecessor)
-
-        # Step 3: Traverse the main path and explore branches on each side
-        for depth, node in enumerate(longest_path):
-            # Alternate between left and right for balanced layout
-            if branch_counter["left"] <= branch_counter["right"]:
-                explore_branches(node, -depth, "left", is_predecessor=True)   # Explore left predecessors
-                explore_branches(node, -depth, "left", is_predecessor=False)  # Explore left successors
-                branch_counter["left"] += 1
-            else:
-                explore_branches(node, -depth, "right", is_predecessor=True)  # Explore right predecessors
-                explore_branches(node, -depth, "right", is_predecessor=False) # Explore right successors
-                branch_counter["right"] += 1
-
-        return node_positions
-
-    def visualize(self, Bpflag=False,Adapterflag=True,min_width=250, min_height=400, point_scale=300,fontsize=120,ID_range=None):
-        """Visualizes the graph with layers and connections between nodes.
-        
-        Args:
-            BP_flag (bool): Flag to include or exclude BP nodes in the visualization.
-            Adapterflag (bool): Flag to include or exclude Adapter nodes in the visualization.
-            max_width (int): Maximum width of the figure in inches.
-            max_height (int): Maximum height of the figure in inches.
-            point_scale (int): Scale for the node marker size.
-            fontsize (int): Font size for node labels.
-            ID_range (list): List of two integers representing the range of node IDs to visualize.
-            
-        Returns:
-            None: Displays the graph with layers and connections between nodes.
-        """
-        
-        graph,bp_graph = self.convert_to_nx_graph(Bpflag=Bpflag,Adapterflag=Adapterflag,ID_range=ID_range)
-        print(bp_graph)
-        node_positions1 = self.assign_coordinates(bp_graph)
-        node_positions2 = self.assign_coordinates(graph)
-        print('pos done!')
-
-        def create_group(nodes, adjusted_positions, y):
-                """Creates a group, adjusts node positions, and calculates group center and radius."""
-                if len(nodes) > 1:
-                    # 聚拢化: 将节点分布在新中心位置
-                    avg_x = sum(x for _, x in nodes) / len(nodes)
-                    new_x_positions = []
-                    new_nodes_list = []
-                    for i, (node, _) in enumerate(nodes):
-                        new_x = avg_x + (i - (len(nodes) - 1) / 2) * 0.5  # Space by 0.5 instead of 1
-                        adjusted_positions[node] = (new_x, y)
-                        new_x_positions.append(new_x)
-                        new_nodes_list.append((node, new_x))
-                    radius = (max(new_x_positions) - min(new_x_positions)) / 2
-                else:
-                    node, x = nodes[0]
-                    avg_x = x
-                    radius = 0
-                    new_nodes_list = [(node, x)]
-                
-                return {'center': avg_x, 'radius': radius, 'nodes': new_nodes_list}
-        def draw(node_positions, path, min_width=250, min_height=400, point_scale=300, fontsize=150):
-            """
-            Draw the graph using precomputed node positions.
-            
-            Args:
-                node_positions (dict): Dictionary where keys are nodes and values are (x, y) coordinates.
-                graph (networkx.Graph): The graph structure with nodes and edges.
-                path (str): File path to save the output image.
-                min_width (int): Minimum width of the figure in inches.
-                min_height (int): Minimum height of the figure in inches.
-                point_scale (int): Scale for the node marker size.
-                fontsize (int): Font size for node labels.
-            """
-            adjusted_positions = node_positions.copy()
-            layers = {}
-
-            # Step 1: Group nodes by layer and label, calculate group centers and radii
-            group_centers = {}
-            for node, (x, y) in node_positions.items():
-                node_label = graph.nodes[node].get('label', node)
-                if y not in layers:
-                    layers[y] = {}
-                if node_label not in layers[y]:
-                    layers[y][node_label] = []
-                layers[y][node_label].append((node, x))
-
-            for y, label_dict in layers.items():
-                group_centers[y] = []             
-                for label, nodes in label_dict.items():
-                    # Sort nodes by x-coordinate to ensure they are grouped logically within their half
-                    nodes.sort(key=lambda item: item[1])
-                    # Separate nodes into left and right groups based on x-coordinate sign
-                    left_group = [(node,x) for node, x in nodes if x <= 0]
-                    right_group = [(node,x) for node, x in nodes if x > 0]
-                    # Group left-side nodes and right-side nodes independently
-                    if left_group:
-                        group_centers[y].append(create_group(left_group, adjusted_positions, y))
-                    if right_group:
-                        group_centers[y].append(create_group(right_group, adjusted_positions, y))
-
-            # Step 2: Adjust positions of each group within a layer to maintain minimum separation
-            for y, groups in group_centers.items():
-                # Sort groups by distance of center from x = 0 to adjust from middle outward
-                group_left=[g for g in groups if g['center']<=0]
-                group_right=[g for g in groups if g['center']>0]
-                group_left.sort(key=lambda g: abs(g['center']))
-                group_right.sort(key=lambda g: abs(g['center']))
-                                   
-                def adjust_group(part_groups):
-                    # Adjust group positions with respect to each other
-                    last_center, last_radius = None, None
-                    for group in part_groups:
-                        center_x, radius, nodes = group['center'], group['radius'], group['nodes']
-                        # Determine offset if there is overlap with the previous group
-                        if last_center is not None:
-                            # Calculate offset required to avoid overlap
-                            if center_x>0:
-                                offset =  1 + last_radius + radius +(last_center-center_x)
-                            else:
-                                offset =  -(1 + last_radius + radius +(center_x-last_center))
-                            # Adjust based on the relative position of the centers
-                            new_center_x = center_x + offset
-                        else:
-                            if center_x>0:
-                                new_center_x =  radius+1
-                                offset=new_center_x-center_x
-                            else:
-                                new_center_x =  -radius-1
-                                offset=new_center_x-center_x
-                        # Update last_center and last_radius for the next group
-                        last_center, last_radius = new_center_x, radius
-
-                        # Assign shifted x positions to nodes in the group
-                        for i, (node, x) in enumerate(nodes):
-                            # Distribute nodes within the group around the new center
-                            new_x = x + offset
-                            adjusted_positions[node] = (new_x, y)
-                adjust_group(group_left)
-                adjust_group(group_right)
-
-            node_positions=adjusted_positions
-            # Calculate the figure size based on node_positions range
-            x_values, y_values = zip(*node_positions.values())
-            x_range = max(x_values) - min(x_values)
-            y_range = max(y_values) - min(y_values)
-            figsize_x = max(min_width, x_range * 25)
-            figsize_y = max(min_height, y_range * 8)
-            
-            # Create the figure
-            plt.figure(figsize=(figsize_x, figsize_y), dpi=10)
-            
-            # Define colors
-            color_list = ['skyblue', 'lightgreen', 'wheat', 'lightcoral', 'lightsalmon', 'lightpink', 'thistle', 'goldenrod', 'peachpuff', 'paleturquoise']
-            color_map = dict()
-            offset = 0
-            
-            # Draw nodes at their precomputed positions
-            for node, (x, y) in node_positions.items():
-                node_label = graph.nodes[node].get('label', node)
-                # Choose color for each node label if not already assigned
-                if node_label in color_map:
-                    color = color_map[node_label]
-                else:
-                    color = color_list[offset % len(color_list)]
-                    color_map[node_label] = color
-                    offset += 1
-                
-                plt.plot(x, y, 'o', markersize=point_scale, color=color)  # Draw node
-                plt.text(x, y + 0.2, node, ha='center', fontsize=fontsize)  # Display node id
-                plt.text(x, y - 0.2, node_label, ha='center', fontsize=fontsize)  # Display node label
-
-            # Draw edges based on node positions
-            for start_node, end_node in graph.edges:
-                if start_node in node_positions and end_node in node_positions:
-                    # Get the coordinates of the start and end nodes
-                    x_start, y_start = node_positions[start_node]
-                    x_end, y_end = node_positions[end_node]
-                    node_label = graph.nodes[end_node].get('label', node)
-                    color=color_map[node_label]
-                    index = color_list.index(color)
-                    color_list_dark = ['#5CACEE', '#66CDAA', '#CDAA7D', '#CD5C5C', '#E9967A', '#FF6A6A', '#D8BFD8', '#B8860B', '#FFA07A', '#96CDCD']
-                    color=color_list_dark[index]
-                    # Draw edge directly between the nodes
-                    if y_start- y_end>40:
-                        color='black'
-                    plt.plot([x_start, x_end], [y_start, y_end], color, linewidth=2)
-
-            # Configure plot display
-            plt.axis('off')  # Hide the axes
-            plt.tight_layout()  # Reduce extra margins
-            
-            # Save and display the image
-            plt.savefig(path, dpi=10)
-            plt.show()
-        perfix='/data/haiqwa/zevin_nfs/andy/Auto-Parallelization/nnscaler_group1/qinghe/examples/llama3_8B_128K/'
-        draw(node_positions1,f'{perfix}/view_graph/bp_graph_1.png')
-        draw(node_positions2,f'{perfix}/view_graph/fw_graph_2.png')
-
-
 
     # ========================== Graph Creation ========================
 
@@ -858,7 +446,8 @@ class IRGraph(IRSegment):
 
         # get partitioned sub-nodes
         fnodes = algo.instantiate(**config)
-        assert fnodes is not None, f"Fail to partition node: {node} use algorithm and config: {config}"
+        if not fnodes:
+            raise ValueError(f"Fail to partition node: {node}. Please check your config: {config}.")
 
         # insert forward node
         fsegment: IRSegment = self.segment(node)
@@ -1083,12 +672,8 @@ class IRGraph(IRSegment):
             assert isinstance(node, (IRFwOperation, IRDataOperation)), \
                 "Only forward operators and dataloader operators are allowed to assign devices"
             node.device = device
-            f= open("./log/allocation.txt", "a")
-            print(f"node{node} is placed on device {device}",file=f)
             if node.mirror is not None:
                 node.mirror.device = device
-                print(f"node{node.mirror} is placed on device {device}",file=f)
-            f.flush() 
         return True
 
     def reside(self, tensor: IRSubTensor, devices: Union[int, List[int]]):

@@ -2,16 +2,17 @@
 #  Licensed under the MIT License.
 
 from __future__ import annotations
-
+import math
+import torch
 from nnscaler.graph.graph import IRGraph
 from nnscaler.graph.function.anchor import IRGraphAnchor
-from nnscaler.graph.function.dimops import IRDimops
+from nnscaler.graph.function.dimops import IRDimops,DimopSplit
 from nnscaler.ir.operator import IRFwOperation
 from nnscaler.ir.cten import IRObject, IRTensor
 from .cube_operator import CubeOperator
 from .autodist_config import AutoDistConfig
 from .cost_database import CostDatabase
-
+from .descs import *
 from dataclasses import dataclass
 from collections import deque
 import logging
@@ -523,8 +524,14 @@ class ModelGraph:
     def __init__(self, ir_graph: IRGraph, autodist_config: AutoDistConfig):
         self.ir_graph = ir_graph
         self.autodist_config = autodist_config
-        self.cost_database = CostDatabase(self.ir_graph, self.autodist_config)        
-        self.cost_database.profile_comp(partition_degree=1)
+        self.cost_database = CostDatabase(
+                                autodist_config=autodist_config, #qinghe add this argument
+                                graph=self.ir_graph,
+                                profile_dir=autodist_config.profile_dir, 
+                                memory_granularity=autodist_config.memory_granularity,
+                                ignore_small_tensor_threshold=autodist_config.ignore_small_tensor_threshold,
+                             )
+        self.cost_database.profile_comp(1, autodist_config.parallel_profile, autodist_config.re_profile)
 
         self.scope_tree_root = self.reconstruct_scope_tree()
         self.scope_leaf_nodes = self.scope_tree_root.select(lambda x: x.is_leaf)
@@ -565,6 +572,7 @@ class ModelGraph:
             module_info = []
             for module_path, module_type in node.module_stack.items():
                 module_info.append((module_path.split('.')[-1], module_type))
+                
             root.insert(node, module_info, calc_flops(node), fw_span, idx=i)
 
         root.pull_up(db)
@@ -614,6 +622,66 @@ class ModelGraph:
         if not pivot_idxs:
             raise RuntimeError(f'cannot find any pivot in {pp_pivot_modules}')
         return pivot_idxs
+    
+    def calc_pivot_comm_cost(self, src_paratition: Tuple[int, NodePartitionDesc], dst_paratition: Tuple[int, NodePartitionDesc], Bindwidth_type: str) -> float:
+        '''
+        Calculate communication cost between stages from source partition to destination partition.
+
+        Args:
+            src_partition: Tuple containing source node ID and partition description
+            dst_partition: Tuple containing destination node ID and partition description
+            bandwidth_type: Type of bandwidth ("inter" or "intra")
+
+        Returns:
+            float: Total communication cost in seconds
+
+        Raises:
+            ValueError: If invalid bandwidth type is provided
+        '''
+
+        assert Bindwidth_type in ("inter", "intra")
+
+        def calculate_memory(tensor: torch.Tensor) -> int:
+            """Calculate memory size of a tensor in bytes."""
+            dtype_byte_size = {
+                torch.bfloat16: 2,
+                torch.float16: 2,
+                torch.float32: 4
+            }
+            
+            if tensor.dtype not in dtype_byte_size:
+                raise ValueError(f"Unsupported dtype: {tensor.dtype}. Supported types: {list(dtype_byte_size.keys())}")
+            
+            num_elements = math.prod(tensor.shape)
+            return num_elements * dtype_byte_size[tensor.dtype]
+        
+        #total tensor size
+        tensor_byte = 0
+        src_cell = self.ir_graph.node(src_paratition[0])
+        dst_cell = self.ir_graph.node(dst_paratition[0])
+        for i, src_t in enumerate(src_cell.outputs()):
+            for j, dst_t in enumerate(dst_cell.inputs()):
+                if src_t == dst_t:
+                    tensor_byte = tensor_byte + calculate_memory(src_t)
+        ((src_idx, src_dim),src_p_num) = src_paratition[1].desc[0]
+        ((dst_idx, dst_dim),dst_p_num) = dst_paratition[1].desc[0]
+        p2p_cost = 0
+        aggregate_cost = 0
+        if src_idx == -1:
+            aggregate_cost = 0
+        else :
+            aggregate_cost = self.cost_database.primitive_to_cost(dev_num = src_p_num, byte_size = tensor_byte//src_p_num, primitive = 'all gather', dp_comm_mesh = (1, src_p_num))
+        
+        #p2p_cost
+        if Bindwidth_type == 'inter':
+            p2p_cost = self.cost_database.primitive_to_cost(dev_num = 2, byte_size = tensor_byte//max(src_p_num,dst_p_num) if dst_idx != -1 else tensor_byte, primitive = 'move', dp_comm_mesh = (2, 1))
+        elif Bindwidth_type == 'intra':
+            p2p_cost = self.cost_database.primitive_to_cost(dev_num = 2, byte_size = tensor_byte//max(src_p_num,dst_p_num) if dst_idx != -1 else tensor_byte, primitive = 'move', dp_comm_mesh = (1, 2))
+        else:
+            raise ValueError(f'Invalid Bindwidth_type: {Bindwidth_type} provided.')
+        
+        return p2p_cost + aggregate_cost
+        
 
     def calc_interval_info(self, start: int, end: int) -> IntervalInfo:
         '''

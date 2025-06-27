@@ -1,6 +1,8 @@
+examples/.nnscaler
+examples/logs
+nnscaler.egg-info
 build/
-examples/
-nnscaler.egg-info/
 *.log
 *.so
 *.whl
+__pycache__/

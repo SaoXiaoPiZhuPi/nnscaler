@@ -1,6 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
+# from loong.nnscaler.autodist import autodist_config
 from .model_graph import ModelGraph, collect_depth2scope_nodes
 from .cube_operator import CubeOperator
 from .descs import *
@@ -32,7 +33,7 @@ __all__ = [
 _logger = logging.getLogger(__name__)
 
 _PLAN_ANALYSIS_LIST_TIME_TOP_NUM = 10
-_PLAN_ANALYSIS_LIST_PARTITIONS_TOP_NUM = 20000
+_PLAN_ANALYSIS_LIST_PARTITIONS_TOP_NUM = 10
 _PLAN_ANALYSIS_MODULE_MAX_DEPTH = 4
 _PLAN_ANALYSIS_MODULE_TOP_NUM = 3
 
@@ -44,6 +45,10 @@ class PartitionCostDesc:
     # the communication cost when updating the weights
     # currently, it is estimated by allreduce time
     weight_update_time: float
+
+    weight_update_size:float
+
+    comm_mesh: Tuple[int, int]
     # the minimum memory required for the partition, including
     # 1. activation memory
     # 2. weight memory (weight needs gradient)
@@ -153,6 +158,7 @@ class SPMDSolver:
         graph: ModelGraph,
         autodist_config: AutoDistConfig,
         mesh_desc: MeshDesc,
+        dp_group_mesh: Tuple[int, int],
         stage_num: int = 1,
         micro_batch_num: int = 1,
     ):
@@ -174,8 +180,9 @@ class SPMDSolver:
             _logger.info('no partition constraint is loaded')
 
         self.cost_database = graph.cost_database
-        self.cost_database.profile_comp(self.device_num)
+        self.cost_database.profile_comp(self.device_num, autodist_config.parallel_profile, autodist_config.re_profile)
         self.stage_num = stage_num
+        self.dp_group_mesh = dp_group_mesh
 
         self.initialize()
 
@@ -615,8 +622,8 @@ class SPMDSolver:
             cur_p_fathers = self.p_fathers[i]
             partitions = [None] * p_num
             for j, p_father in enumerate(self.p_fathers[i]):
-                if p_father == -1:
-                    raise RuntimeError(f'find -1 in p_fathers for operator {i}')
+                if p_father == -1 or partitions[p_father] is not None:
+                    raise RuntimeError(f'illegal p_fathers {self.p_fathers[i]} for {self.get_operator(i).ir_cell}')
                 partitions[p_father] = self._op_partitions[i][j]
             self._op_partitions[i] = partitions
             self.p_fathers[i] = list(range(p_num))
@@ -637,6 +644,8 @@ class SPMDSolver:
         micro_batch_num = self.micro_batch_num
         is_train = self.autodist_config.is_train
         tgt_p = self._op_partitions[op_idx][partition_idx]
+        partition_dpsize = 0.0
+        comm_mesh = (-1,-1)
         if is_train:
             # only calculate the communication cost for the weight that requires gradient
             weights_require_grad = []
@@ -648,19 +657,25 @@ class SPMDSolver:
             assert all(weights_require_grad) or not any(
                 weights_require_grad
             ), f'expect all weights require grad or not, got {weights_require_grad}'
-            if isinstance(tgt_p, IRDimops) and any(weights_require_grad):
-                weight_comm_time = self.cost_database.calc_weight_update_time(
-                    cur_partition=tgt_p)
+            # if isinstance(tgt_p, IRDimops) and any(weights_require_grad):
+            if isinstance(tgt_p, OpPartition) and any(weights_require_grad):
+                # weight_comm_time = self.cost_database.calc_weight_update_time(
+                #     cur_partition=tgt_p, dp_group_mesh=self.dp_group_mesh) / self.autodist_config.update_freq
+
+                weight_comm_time ,partition_dpsize, comm_mesh= self.cost_database.calc_weight_update_time(
+                    cur_partition=tgt_p, dp_group_mesh=self.dp_group_mesh) 
+                # edit by Andy
             else:
                 weight_comm_time = 0
         else:
             weight_comm_time = 0
 
-        if not self.autodist_config.consider_mem:
+        cfg = self.autodist_config
+        if not cfg.consider_mem:
             node_mem, node_buffer, act_mem, opt_transient_mem, in_mem = 0, 0, 0, 0, 0
         else:
             node_mem, node_buffer, act_mem, opt_transient_mem, in_mem = self.cost_database.get_mem_and_buffer(
-                tgt_p, self.is_train, self.stage_num)
+                tgt_p, self.is_train, self.stage_num, cfg.world_size, cfg.ngpus, cfg.zero_stage, cfg.zero_ngroups, cfg.opt_resident_coef, cfg.opt_transient_coef)
 
         # communication cost induced by partitioning activation tensors of the given op partition
         comm_vecs = []
@@ -696,10 +711,12 @@ class SPMDSolver:
                 is_train=is_train)
         else:
             comp_time = 0.0
-
+        # print(f'micro_batch_num:{micro_batch_num}')
         return PartitionCostDesc(
             comp_time=micro_batch_num * comp_time,
-            weight_update_time=weight_comm_time,
+            weight_update_time=weight_comm_time / self.autodist_config.update_freq,
+            weight_update_size=partition_dpsize,
+            comm_mesh=comm_mesh,
             mem=node_mem,
             in_mem=in_mem,
             transient_mem=node_buffer,
@@ -723,9 +740,7 @@ class SPMDSolver:
                     )
                     cost_desc.comp_time = 0.0
                 cur_info.append(cost_desc)
-                f = open(f'./log/profile_comm_log.txt', 'a')
-                print(f'{self.get_operator(i)=},{cost_desc}',file=f)
-                _logger.debug(f'{self._op_partitions[i][j]}, {cost_desc}')
+                _logger.debug(f'{self._op_partitions[i][j]} {cost_desc}')
             self.partition_info.append(cur_info)
             cut_partition_cnts = [self.get_op_partition_count(idx) for idx in self.cut_ops[i]]
             cur_state_num = functools.reduce(lambda x, y: x * y, cut_partition_cnts, 1)
@@ -753,7 +768,7 @@ class SPMDSolver:
             ratio, i = importance_ratios[idx]
             node = self.get_operator(i).ir_cell
             desc_str += f'operator {node} has {self.get_op_partition_count(i)} partitions, importance ratio {ratio:.3f}\nat {node.comment}\n\n'
-        _logger.info(desc_str)
+        _logger.debug(desc_str)
         _logger.info('finish spmd solver initializetion')
 
     def estimate_min_mem(self, start: int, end: int) -> int:
@@ -889,6 +904,58 @@ class SPMDSolver:
             desc = self.partition_info[op_idx][p_idx]
             cost += desc.comp_time + desc.weight_update_time
         return cost
+    
+    def calc_all_time(self, plan: List[Tuple[int, int]]) -> float:
+        '''
+        calculate the inner time cost of the plan: computation time + weight update time
+
+        Args:
+            plan (List[Tuple[int, int]]): the plan to be evaluated
+
+        Returns:
+            float: the inner time cost of the plan
+        '''
+        cost = 0.0
+        for op_idx, p_idx in plan:
+            desc = self.partition_info[op_idx][p_idx]
+            comm_time = sum(sum(sublist) for sublist in self.partition_info[op_idx][p_idx].comm_time)
+            cost += desc.comp_time + desc.weight_update_time + comm_time
+        return cost
+
+    def calc_weight_update_time_cost(self, plan: List[Tuple[int, int]]) -> float:
+        '''
+        calculate the weight_update time cost of the plan
+
+        Args:
+            plan (List[Tuple[int, int]]): the plan to be evaluated
+
+        Returns:
+            float: the weight_update time cost of the plan
+        '''
+        cost = 0.0
+        dp_size: dict[tuple[int, int], float] = {}
+        for op_idx, p_idx in plan:
+            desc = self.partition_info[op_idx][p_idx]
+            if desc.comm_mesh not in dp_size:
+                dp_size[desc.comm_mesh] = 0.0
+            dp_size[desc.comm_mesh]+=desc.weight_update_size
+
+        for comm_mesh, size in dp_size.items():
+            if(comm_mesh == (-1,-1)):
+                continue   
+            (a,b) = comm_mesh             
+                        
+            stage_rs_time = self.cost_database.primitive_to_cost(dev_num=a*b,
+                                            primitive='reduce scatter',
+                                            byte_size=size ,dp_comm_mesh=comm_mesh)
+            stage_ag_time = self.cost_database.primitive_to_cost(dev_num=a*b,
+                                            primitive='all gather',
+                                            byte_size=size ,dp_comm_mesh=comm_mesh)
+            
+            cost = cost + stage_rs_time + stage_ag_time              
+        # print(f'dp_size:{dp_size}, dp_cost:{cost}')
+        total_sum = sum(dp_size.values())
+        return cost,total_sum
 
     def calc_intra_time_cost(self, plan: List[Tuple[int, int]]) -> float:
         '''
@@ -1111,8 +1178,7 @@ class SPMDSolver:
             "Please install ILP solvers by 'sudo apt install coinor-cbc'")
 
         solver = pulp.PULP_CBC_CMD(mip=True,
-                                #    msg=self.verbose,
-                                   msg=True,
+                                   msg=self.verbose,
                                    timeLimit=600,
                                    threads=multiprocessing.cpu_count())
 
@@ -1187,16 +1253,7 @@ class SPMDSolver:
               topk: int) -> List[List[SPMDSearchOutput]]:
         import cppimport.import_hook
         try:
-            if self.autodist_config.priority == 'time':
-                import nnscaler.autodist.dp_solver as dp_solver
-            elif self.autodist_config.priority == 'mem':
-                import nnscaler.autodist.dp_solver_mem as dp_solver
-            elif self.autodist_config.priority == 'test':
-                import nnscaler.autodist.dp_solver_test as dp_solver
-            else:
-                raise RuntimeError(
-                f'Load DP solver with invalid priority:  {self.autodist_config.priority} '
-            )
+            import nnscaler.autodist.dp_solver as dp_solver
         except ImportError:
             raise RuntimeError(
                 'Failed to import solver. '
@@ -1219,6 +1276,7 @@ class SPMDSolver:
             for i, partition in enumerate(self._op_partitions[idx]):
                 p_cost_desc = self.partition_info[idx][i]
                 solver.add_partition(idx, i, p_cost_desc.comp_time + p_cost_desc.weight_update_time,
+                # solver.add_partition(idx, i, p_cost_desc.comp_time, #loong alter this code
                 p_cost_desc.mem // mem_divisor, p_cost_desc.in_mem // mem_divisor, int(buf_mul * p_cost_desc.transient_mem // mem_divisor),
                 p_cost_desc.activation_mem // mem_divisor, p_cost_desc.opt_transient_mem // mem_divisor,
                 self.p_fathers[idx][i], p_cost_desc.comm_time)
@@ -1229,7 +1287,13 @@ class SPMDSolver:
             descs = []
             for result in cpp_results:
                 desc = self.build_tp_desc(result.path)
-                descs.append(SPMDSearchOutput(desc, result.memory * mem_divisor / 1024 / 1024 / 1024, result.all_time, self.calc_inner_time_cost(result.path)))
+                self.analyze_plan(result.path)
+                #qinghe add the property weight_update_time
+                weight_update_time,dp_size=self.calc_weight_update_time_cost(result.path)
+                inner_time = self.calc_inner_time_cost(result.path)
+                # print(f"result.all_time:{result.all_time} calc_inner_time:{inner_time} weight_update_time:{weight_update_time} tp_cost:{result.all_time-inner_time} dp_size:{dp_size}")
+                # print(f"result.all_time-weight_update_time :{result.all_time - weight_update_time} weight_update_time:{weight_update_time}")
+                descs.append(SPMDSearchOutput(desc, result.memory * mem_divisor / 1024 / 1024 / 1024, result.all_time, inner_time, weight_update_time,dp_size))
             ret.append(descs)
         return ret
 
@@ -1278,6 +1342,8 @@ class SPMDSolver:
             sig2comp_time[sig] += desc.comp_time
             op_idx2comp_time[op_idx] = desc.comp_time
             comp_time_sum += desc.comp_time
+            desc = self.partition_info[op_idx][p_idx]
+        
             comm_cost = 0
             for k, comm_vec in enumerate(desc.comm_time):
                 producer = self.producers[op_idx][k]
@@ -1298,7 +1364,6 @@ class SPMDSolver:
                 sig2comm_time[sig] = 0
             sig2comm_time[sig] += comm_cost
             comm_time_sum += comm_cost
-
         sig2comp_time = sorted(sig2comp_time.items(), key=lambda x: x[1], reverse=True)
         comp_sig_num = min(_PLAN_ANALYSIS_LIST_TIME_TOP_NUM, len(sig2comp_time))
         sig2comp_time = sig2comp_time[:comp_sig_num]
@@ -1377,7 +1442,7 @@ class SPMDSolver:
         return ret
 
     def solve(self, intervals: List[Tuple[int, int]],
-              topk: int) -> List[List[SPMDSearchOutput]]:
+              topk: int) -> List[SPMDSearchOutput]:
         '''
         generate the optimal partition plan for operators in the interval [start, end] by
         integer linear programming (ILP) or dynamic programming (DP). Communication cost
@@ -1514,6 +1579,7 @@ def calc_optimal_spmd_plan(
         Returns:
             PipelineSearchOutput: the optimal plan
     '''
+    start_time = time.time()
     spmd_solver = SPMDSolver(
         graph=model_graph,
         mesh_desc=autodist_config.mesh_desc,
@@ -1522,20 +1588,24 @@ def calc_optimal_spmd_plan(
         micro_batch_num=autodist_config.update_freq,
     )
 
-    spmd_outs = spmd_solver.solve([(0, model_graph.op_num - 1)], autodist_config.topk)[0]
+    spmd_outs = spmd_solver.solve([(0, model_graph.op_num - 1)], 1)[0]
+    total_time = time.time() - start_time
+    print(f'spmd_plan时间:{total_time}')
     if not spmd_outs:
         raise RuntimeError(
             'fail to find a valid partition plan, ' \
             'try to increase device number or reduce batch size'
         )
     spmd_out = spmd_outs[0]
-    print(f'fcz: total memery:{spmd_out.memory} GB, all time:{spmd_out.all_time} s, comp time:{spmd_out.comp_time} s')
     pp_desc = PipelineParallelDesc(
         spmd_descs=[spmd_out.desc],
         recompute_groups=spmd_out.desc.recompute_groups,
         mesh_desc=spmd_out.desc.mesh_desc,
     )
     pp_out = PipelineSearchOutput(
+        dp_group_mesh=(1, autodist_config.mesh_desc.ngpus),
+        tp_groups=[[autodist_config.mesh_desc.ngpus]],
+        indices=[[0]],
         desc=pp_desc,
         e2e_time=spmd_out.all_time,
         stage_mems=[spmd_out.memory],

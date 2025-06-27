@@ -66,6 +66,8 @@ class SPMDSearchOutput:
     memory: float
     all_time: float
     comp_time: float
+    weight_update_time: float
+    dp_size: float
 
     def to_json(self):
         return {
@@ -107,6 +109,9 @@ class PipelineParallelDesc:
 
 @dataclass
 class PipelineSearchOutput:
+    dp_group_mesh: Tuple[int,int]
+    tp_groups: List[List[int]]
+    indices: List[List[int]]
     desc: PipelineParallelDesc
     e2e_time: float
     stage_mems: List[float]
@@ -115,6 +120,9 @@ class PipelineSearchOutput:
 
     def to_json(self):
         return {
+            'dp_group_mesh': list(self.dp_group_mesh),
+            'tp_groups': self.tp_groups,
+            'indices': self.indices,
             'desc': self.desc.to_json(),
             'e2e_time': self.e2e_time,
             'stage_mems': self.stage_mems,
@@ -125,7 +133,10 @@ class PipelineSearchOutput:
     @staticmethod
     def from_json(json_val):
         desc = PipelineParallelDesc.from_json(json_val['desc'])
-        return PipelineSearchOutput(desc, json_val['e2e_time'],
+        return PipelineSearchOutput(tuple(json_val['dp_group_mesh']), 
+                                    json_val['tp_groups'],
+                                    json_val['indices'],
+                                    desc, json_val['e2e_time'],
                                     json_val['stage_mems'],
                                     json_val['stage_all_times'],
                                     json_val['stage_comp_times'])

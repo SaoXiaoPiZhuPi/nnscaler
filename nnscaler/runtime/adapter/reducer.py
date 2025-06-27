@@ -1,17 +1,48 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from typing import List, Dict, Tuple, Any, Callable, Optional, Set
+from typing import List, Dict, Tuple, Any, Callable, Optional, Set, Sequence
 from functools import partial
+import math
 import logging
 import torch
+import os
 from torch.utils.hooks import RemovableHandle
 
 from nnscaler.runtime.device import DeviceGroup
 from nnscaler.profiler.timer import CudaTimer
 from nnscaler.flags import RuntimeFlag
+from nnscaler.runtime.comm_counter import Comm_counter
 
+from datetime import datetime  
+import time
 _logger = logging.getLogger(__name__)
+
+
+# According to https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#device-memory-accesses
+# Any address of a variable residing in global memory or returned by one of the memory allocation 
+# routines from the driver or runtime API is always aligned to at least 256 bytes.
+# But in our practice, we found that 16 bytes alignment is enough, it can be modified if unaligned access is detected.
+ALIGNED_BYTES = 16
+
+def _aligned_nbyte(nelement: int, element_size: int, align_size: int = ALIGNED_BYTES) -> int:
+    """
+    Align the number of elements, so the total byte size of elements is multiple of `align_size`
+    Returns:
+        the aligned number of bytes
+    """
+    if align_size % element_size != 0:
+        raise ValueError(f"align_size {align_size} must be divisible by element_size {element_size}")
+    return (nelement * element_size + align_size - 1) // align_size * align_size
+
+
+def _aligned_nelement(nelement: int, element_size: int, align_size: int = ALIGNED_BYTES) -> int:
+    """
+    Align the number of elements, so the total byte size of elements is multiple of `align_size`
+    Returns:
+        the aligned number of elements
+    """
+    return _aligned_nbyte(nelement, element_size, align_size) // element_size
 
 
 def _get_reduce_op(reduce_op: str) -> torch.distributed.ReduceOp:
@@ -32,20 +63,15 @@ def _get_reduce_op(reduce_op: str) -> torch.distributed.ReduceOp:
 
 
 class Bucket:
-
-    # config: whether to use reduce scatter for zero (default False).
-    # By default we use `allreduce` for zero, which is due to
-    # 1) `reduce_scatter` will make some parameters have stale gradient after synchronization,
-    #    hence break the consistency of `.data` and `.grad` of parameters. Need to be careful when using optimizer.
-    # 2) `reduce_scatter`` doesn't significantly improve performance comparing with `allreduce`.
-    use_reduce_scatter_for_zero: bool = False
-
     def __init__(self, params: List[torch.nn.Parameter],
                  param_buffer: torch.Tensor, grad_buffer: torch.Tensor,
                  reduce_op: torch.distributed.ReduceOp,
-                 group, async_op: bool, zero: bool,
+                 group: torch.distributed.ProcessGroup, async_op: bool, zero: bool,
                  zero_subgroup: torch.distributed.ProcessGroup = None,
-                 zero_crossgroup: torch.distributed.ProcessGroup = None):
+                 zero_crossgroup: torch.distributed.ProcessGroup = None,
+                 zero_use_reduce_scatter: bool = False,
+                 align_size: int = ALIGNED_BYTES,
+    ):
         """
         Create a communication unit for parameter allreduce.
 
@@ -53,15 +79,17 @@ class Bucket:
         The parameters are assumed to participate in backward and generate gradient.
 
         Args:
-            params List[torch.nn.Parameter]: the parameters
-            param_buffer torch.Tensor: Paramter contiguous buffer
-            grad_buffer torch.Tensor: gradient contiguous buffer
-            reduce_op torch.distributed.ReduceOp: the reduce op used by collectives
-            group: communication group
-            async_op bool: whether to use asynchronous operation
-            zero bool: whether to use zero optimization on gradients
-            zero_subgroup: the subgroup for zero optimization the current rank belongs to
-            zero_crossgroup: the communication group for cross zero group allreduce when reduce scatter is enabled
+            params (List[torch.nn.Parameter]): the parameters
+            param_buffer (torch.Tensor): Paramter contiguous buffer
+            grad_buffer (torch.Tensor): gradient contiguous buffer
+            reduce_op (torch.distributed.ReduceOp): the reduce op used by collectives
+            group (torch.distributed.ProcessGroup): communication group
+            async_op (bool): whether to use asynchronous operation
+            zero (bool): whether to use zero optimization on gradients
+            zero_subgroup (torch.distributed.ProcessGroup): the subgroup for zero optimization the current rank belongs to
+            zero_crossgroup (torch.distributed.ProcessGroup): the communication group for cross zero group allreduce when reduce scatter is enabled
+            zero_use_reduce_scatter (bool): whether to use reduce scatter for zero optimization
+            align_size (int): the alignment size in bytes for each parameter
         """
 
         self._params: List[torch.nn.Parameter] = params
@@ -75,6 +103,7 @@ class Bucket:
 
         self._async: bool = async_op
         self._zero: bool = zero
+        self._zero_use_reduce_scatter = True
         self._contiguous_params = param_buffer
         self._contiguous_grads = grad_buffer
         assert grad_buffer.size() == param_buffer.size()
@@ -82,8 +111,12 @@ class Bucket:
         # the parameter exposed for optimizer
         self._param_for_optimizer: torch.nn.Parameter = None
         # total number of parameters
+        self._align_size: int = align_size
+        if self._align_size % ALIGNED_BYTES != 0:
+            raise ValueError(f"align_size {self._align_size} must be divisible by {ALIGNED_BYTES}")
+
         self._numel: int = sum(p.numel() for p in self._params)
-        self._padding: int = self._contiguous_grads.size(0) - self._numel
+        self._aligned_numel: int = sum(_aligned_nelement(p.nelement(), p.element_size(), self._align_size) for p in self._params)
 
         self._zero_subgroup = self._group if zero_subgroup is None else zero_subgroup
         self._zgroup_sz: int = torch.distributed.get_world_size(group=self._zero_subgroup)
@@ -112,6 +145,12 @@ class Bucket:
         """Whether enable zero for this bucket"""
         return self._zero
 
+    def get_aligned_numel(self, param) -> int:
+        """
+        Get the aligned number of elements for a parameter
+        """
+        return _aligned_nelement(param.nelement(), param.element_size(), self._align_size)
+
     def _group_reduce_scatter(self):
         """currently this function is only used in synchronous mode"""
         rank = torch.distributed.get_rank(group=self._zero_subgroup)
@@ -119,9 +158,23 @@ class Bucket:
         if self._zgroup_sz == self._wsz:
             # number of zero groups is 1, thus only reduce scatter is enough
             # in this case, self._group == self._zero_subgroup
+            torch.cuda.synchronize()
+            start_time=time.time()
             torch.distributed.reduce_scatter_tensor(
                 partial_tensor, self._contiguous_grads,
                 op=self._reduce_op, group=self._zero_subgroup)
+            
+            torch.cuda.synchronize()
+            end_time=time.time()
+            rank = torch.distributed.get_rank()
+            nranks=torch.distributed.get_world_size(group=self._zero_subgroup)
+            size_MB = self._contiguous_grads.numel() * self._contiguous_grads.element_size() / (1024**2)  # 转换为 MB
+            comm_counter1=Comm_counter()
+            comm_counter1.add_reduce_scatter_tensor_total_size_MB(size_MB)
+            comm_counter1.set_reduce_scatter_tensor_shape(self._contiguous_grads.shape)
+            comm_counter1.add_reduce_scatter_time(end_time-start_time)
+            comm_counter1.set_reduce_scatter_nranks(nranks)
+
         else:
             # two steps for group reduce scatter
             # step #1, allreduce across corresponding GPUs across groups
@@ -137,15 +190,14 @@ class Bucket:
         Build offset for each parameter
         This should only be called once during the construction of bucket.
         """
-        self._numel = sum(p.numel() for p in self._params)
         ofst = 0
         for param in self._params:
             self._pofset[param] = ofst
-            ofst += param.numel()
+            ofst += _aligned_nelement(param.nelement(), param.element_size(), self._align_size)
         # build parameter for optimizer (shared storage).
         # Its gradient will be updated everytime calling `self.sync_grads()`
         if not self._zero:
-            opt = self._contiguous_params[:self._numel]
+            opt = self._contiguous_params
         else:
             rank = torch.distributed.get_rank(group=self._zero_subgroup)
             assert len(self._contiguous_params) % self._zgroup_sz == 0
@@ -168,7 +220,6 @@ class Bucket:
 
         This should only be called once during the construction of bucket.
         """
-
         @torch.no_grad()
         def post_grad_hook(param: torch.nn.Parameter, *unused):
             # stream = DeviceGroup().get_stream('reducer')
@@ -176,12 +227,13 @@ class Bucket:
             # TODO: need to handle sparse gradients in torch.nn.Embedding
             self._contiguous_grads[ofst:ofst+param.numel()].add_(param.grad.data.view(-1))
             param.grad = None
-
+            
             if RuntimeFlag.skip_reducer: return
             self._async_param_cnt += 1
 
             # perform all-reduce
             if self._async:
+                # print(f'_async_param_cnt:{self._async_param_cnt},len(self._params):{len(self._params)}')
                 if self._async_param_cnt > len(self._params):
                     raise RuntimeError(
                         "Detected gradient accumulation with asynchronous Reducer. "
@@ -190,15 +242,17 @@ class Bucket:
                     # apply pre hooks
                     self._apply_pre_hooks()
                     # communication
-                    if self._zero and Bucket.use_reduce_scatter_for_zero:
+                    if self._zero and self._zero_use_reduce_scatter:
                         if self._zgroup_sz == self._wsz:
                             rank = torch.distributed.get_rank(group=self._group)
                             shards = list(self._contiguous_grads.chunk(self._wsz, dim=0))
+                            # inplace reduce scatter is supported
+                            # see https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/api/colls.html#c.ncclReduceScatter
                             self._async_handle = torch.distributed.reduce_scatter(
                                 shards[rank], shards, op=self._reduce_op,
                                 group=self._group, async_op=True)
                         else:
-                            assert False, "reducescatter is not supported in async mode, " \
+                            assert False, "group zero + reducescatter is not supported in async mode, " \
                                           "because the two steps (allreduce, reducescatter) use " \
                                           "two communication groups, which may induce deadlock."
                             self._group_reduce_scatter()
@@ -211,7 +265,7 @@ class Bucket:
             # same trick with FSDP and Megatron
             # reference: https://github.com/pytorch/pytorch/blob/v1.13.1/torch/distributed/fsdp/fully_sharded_data_parallel.py#L3177-L3188
             param_tmp = param.expand_as(param)
-            # gets its AccumulateGrad object.
+            # gets its AccumulateGrad object
             grad_acc = param_tmp.grad_fn.next_functions[0][0]
             hook = grad_acc.register_hook(partial(post_grad_hook, param))
             # grad_acc must keep, otherwise the hook won't take effect
@@ -237,11 +291,21 @@ class Bucket:
             # apply pre-hooks
             self._apply_pre_hooks()
             # synchrnoize gradients
-            if self._zero and Bucket.use_reduce_scatter_for_zero:
+            if self._zero and self._zero_use_reduce_scatter:
                 self._group_reduce_scatter()
             else:
-                torch.distributed.all_reduce(
-                    self._contiguous_grads, op=self._reduce_op, group=self._group)
+                torch.cuda.synchronize()
+                start_time=time.time()
+                torch.distributed.all_reduce(self._contiguous_grads, op=self._reduce_op, group=self._group)
+                torch.cuda.synchronize()
+                end_time=time.time()
+                rank = torch.distributed.get_rank()
+                size_MB = 2*self._contiguous_grads.numel() * self._contiguous_grads.element_size() / (1024**2)  # 转换为 MB
+                comm_counter1=Comm_counter()
+                comm_counter1.add_allreduce_tensor_total_size_MB(size_MB)
+                comm_counter1.set_allreduce_tensor_shape(self._contiguous_grads.shape)
+                comm_counter1.add_allreduce_time(end_time-start_time)
+
             CudaTimer().stop('comm', predefined=True)
         # grads = self._contiguous_grads.clone()
         for param in self._params:
@@ -255,7 +319,7 @@ class Bucket:
             grad = self._contiguous_grads.chunk(self._zgroup_sz, dim=0)[rank]
             self._param_for_optimizer.grad = grad
         else:
-            self._param_for_optimizer.grad = self._contiguous_grads[:self._numel]
+            self._param_for_optimizer.grad = self._contiguous_grads
 
         # apply post-hooks
         self._apply_post_hooks()
@@ -268,7 +332,17 @@ class Bucket:
         rank = torch.distributed.get_rank(group=self._zero_subgroup)
         CudaTimer().start(field_name='comm', predefined=True)
         src_tensor = self._contiguous_params.chunk(self._zgroup_sz, dim=0)[rank]
+        start_time=time.time()
         torch.distributed.all_gather_into_tensor(self._contiguous_params, src_tensor, group=self._zero_subgroup)
+        torch.cuda.synchronize()
+        end_time=time.time()
+        rank = torch.distributed.get_rank()
+        size_MB = self._contiguous_params.numel() * self._contiguous_params.element_size() / (1024**2)  # 转换为 MB
+        comm_counter1=Comm_counter()
+        comm_counter1.add_allgather_tensor_total_size_MB(size_MB)
+        comm_counter1.set_allgather_tensor_shape(self._contiguous_grads.shape)
+        comm_counter1.add_allgather_time(end_time-start_time)
+
         CudaTimer().stop(field_name='comm', predefined=True)
 
     def register_pre_hook(self, fn: Callable):
@@ -299,7 +373,7 @@ class Bucket:
         The pre-hooks will be applied one by one following the order of registration.
         """
         if len(self._pre_hooks) == 0: return
-        grads = self._contiguous_grads[:self._numel]
+        grads = self._contiguous_grads
         for hook in self._pre_hooks:
             hook(grads)
 
@@ -309,7 +383,7 @@ class Bucket:
         The post-hooks will be applied one by one following the order of registration.
         """
         if len(self._post_hooks) == 0: return
-        grads = self._contiguous_grads[:self._numel]
+        grads = self._contiguous_grads
         for hook in self._post_hooks:
             hook(grads)
 
@@ -328,34 +402,56 @@ class Bucket:
 
 
 class Reducer:
+    # the default bucket cap for async reducer in megabytes
+    # with the same value as pytorch
+    # https://github.com/pytorch/pytorch/blob/4fd16dd8aa259cd75c9a6d2ddcd8171cd1ee8e28/torch/nn/parallel/distributed.py#L548
+    _DEFAULT_BUCKET_CAP_MB = 25  # 25MB, the same as pytorch
 
-    def __init__(self, ranks: List[int], max_bucket_size_bytes=536870912,
+    def __init__(self, ranks: List[int], max_bucket_size_bytes: Optional[int] = None,
                  reduce_op: str = 'sum', async_op: bool = False,
-                 zero: bool = False, zero_ngroups: int = 1):
+                 zero: bool = False, zero_ngroups: int = 1,
+                 zero_use_reduce_scatter: bool = False,
+                 align_size: int = ALIGNED_BYTES
+    ):
         """
         Create a reducer applied on a set of weights for weight reduction
 
         This assumes the communication group is already created by every rank.
 
-        @param ranks List[int]: reducer communication group
-        @param max_bucket_size_bytes int: largest bucket size for one-time communication,
-            only work for asynchronous reducer.
-        @param reduce_op str: reduce operation, can be 'sum', 'avg', 'max' or 'min' (default 'sum')
-        @param async_op bool: whether to overlap with backward computation (default False)
-        @param zero bool: whether to apply ZeRO optimization on gradients
-        @param zero_ngroups int: number of ZeRO subgroups in the original ZeRO group
+        Args:
+            ranks (List[int]): reducer communication group
+            max_bucket_size_bytes (Optional[int]): largest bucket size for one-time communication,
+                `0` or `None` will use default value,
+                which is `_DEFAULT_BUCKET_CAP_MB` for async reducer, and no limit for sync reducer.
+                Default is `None`
+            reduce_op (str): reduce operation, can be 'sum', 'avg', 'max' or 'min' (default 'sum')
+            async_op (bool): whether to overlap with backward computation (default False)
+            zero (bool): whether to apply ZeRO optimization on gradients
+            zero_ngroups (int): number of ZeRO subgroups in the original ZeRO group
+            zero_use_reduce_scatter (bool): whether to use reduce scatter for zero optimization
+            align_size (int): the alignment size in bytes for each parameter
         """
         self._params: List[torch.nn.Parameter] = list()
         self._param_ids: Set[int] = set()
         self._numel: int = 0
         self._ranks = ranks
         self._group = DeviceGroup().get_group(ranks)
-        self._bucket_size: Optional[int] = max_bucket_size_bytes if async_op else None
+        self._wsz: int = torch.distributed.get_world_size(group=self._group)
+
+        self._bucket_size: Optional[int] = max_bucket_size_bytes
+        if not self._bucket_size and async_op:
+            self._bucket_size = self._DEFAULT_BUCKET_CAP_MB * 1024 * 1024
+
         self._reduce_op = _get_reduce_op(reduce_op)
         # buckets stands for a transission unit
         self._buckets: List[Bucket] = list()
         self._async: bool = async_op
         self._zero: bool = zero
+        self._zero_use_reduce_scatter = True
+        self._align_size: int = align_size
+        if self._align_size % ALIGNED_BYTES != 0:
+            raise ValueError(f"align_size {self._align_size} must be divisible by {ALIGNED_BYTES}")
+
         # contiguous parameter buffer and gradient buffer
         self._contiguous_params: torch.Tensor = None
         self._contiguous_grads: torch.Tensor = None
@@ -368,8 +464,14 @@ class Reducer:
         # the ranks will be divided into [0, 1, 2, 3] and [4, 5, 6, 7].
         # If the ranks are [0, 2, 4, 6], zero_ngroups=2, then the ranks
         # will be divided into [0, 2] and [4, 6].
-        if self._zero and Bucket.use_reduce_scatter_for_zero:
+        if self._zero and self._zero_use_reduce_scatter:
             _logger.info(f"Using reduce scatter for ZeRO optimization")
+            # TODO: In current implementation of Bucket,
+            # zero_use_reduce_scatter works when zero_ngroups > 1 in sync mode
+            # We can enable it in sync mode when it is proved to be useful.
+            if zero_ngroups > 1:
+                raise ValueError("reduce scatter is not supported when zero_ngroups > 1")
+
         if zero_ngroups > 1:
             assert self._zero, f"USE_ZERO must be set when ZERO_NUM_GROUPS is larger than 1"
             assert len(ranks) % zero_ngroups == 0, f"length of ranks {ranks} must be divisible by zero factor {zero_ngroups}"
@@ -379,7 +481,7 @@ class Reducer:
             sub_ranks = ranks[group_idx * zgroup_sz : (group_idx + 1) * zgroup_sz]
             if len(sub_ranks) > 1:
                 assert DeviceGroup().group_exists(sub_ranks), f"zero subgroup {sub_ranks} does not exist in comm groups"
-            self._zero_subgroup = DeviceGroup().get_group(sub_ranks)
+            self._zero_subgroup = DeviceGroup().get_group(sub_ranks)#获取当前rank所在的sungroup
             # crossgroup is for the allreduce across zero subgroups, it is only used when
             # reduce scatter is enabled and the number of zero subgroups is larger than 1.
             start_rank = curr_rank % zgroup_sz
@@ -397,11 +499,11 @@ class Reducer:
         return self._zero_ngroups
 
     @property
-    def params(self) -> Tuple[torch.nn.Parameter]:
+    def params(self) -> Tuple[torch.nn.Parameter, ...]:
         return tuple(self._params)
 
     @property
-    def ranks(self) -> Tuple[int]:
+    def ranks(self) -> Tuple[int, ...]:
         return tuple(self._ranks)
 
     @property
@@ -415,7 +517,7 @@ class Reducer:
         return self._zero
 
     @property
-    def buckets(self) -> Tuple[Bucket]:
+    def buckets(self) -> Tuple[Bucket, ...]:
         return tuple(self._buckets)
 
     @property
@@ -447,37 +549,43 @@ class Reducer:
 
         The parameters in each bucket have consistent data types,
         and each bucket contains at least one parameter.
-        If the bucket contains more than 2 parameters, than the total size is samller
+        If the bucket contains more than 2 parameters, than he total size is samller
         than the max_bucket_size_bytes.
         """
         # step 1: build bucket for overlapping gradient synchronization
-        bucket_size = self._numel * 8 + 1 if self._bucket_size is None else self._bucket_size
-        buckets = {}
-        dtype2size = {}
+        # self._numel * 8 + 1 here is to make sure
+        # the bucket size is larger than the total size of all parameters
+        # 8 is the size of float64, which is the largest data type in PyTorch
+
+        # TODO: we may use a small bucket size for the first bucket, which is used in pytorch
+        # https://github.com/pytorch/pytorch/blob/4fd16dd8aa259cd75c9a6d2ddcd8171cd1ee8e28/torch/nn/parallel/distributed.py#L1172C17-L1172C36
+        # TODO: use native version of reducer, which is more efficient
+        #       (used in pytorch, with a couple percentage improvement)
+        bucket_size = self._numel * 8 + 1 if not self._bucket_size else self._bucket_size
+
+        # items in the bucket is params list
+        seq_buckets: List[List[torch.nn.Parameter]] = []
+        last_bucket_size = None
+
+        assert len(set(p.dtype for p in self._params)) == 1, (
+            "All parameters in the reducer should have the same data type"
+        )
         for param in self._params:
             if param.requires_grad:
-                cur_byte_size = param.nelement() * param.element_size()
-                tp = param.data.type()
-                if tp not in buckets:
-                    buckets[tp] = [[param]]
-                    dtype2size[tp] = cur_byte_size
+                cur_byte_size = _aligned_nelement(param.nelement(), param.element_size(), self._align_size) * param.element_size()
+                # also work when cur_byte_size > bucket_size
+                # It will go the `else` branch
+                # and finish the current bucket and start a new bucket.
+                # This new bucket will be sealed in the next iteration
+                if len(seq_buckets) == 0:
+                    seq_buckets.append([param])
+                    last_bucket_size = cur_byte_size
+                elif last_bucket_size + cur_byte_size <= bucket_size:
+                    seq_buckets[-1].append(param)
+                    last_bucket_size += cur_byte_size
                 else:
-                    if cur_byte_size > bucket_size:
-                        _logger.warning(f'find one parameter {param.shape} ({cur_byte_size} bytes) larger than bucket size {self._bucket_size}')
-                        buckets[tp].insert(0, [param])
-                    elif dtype2size[tp] + cur_byte_size <= bucket_size:
-                        dtype2size[tp] = dtype2size[tp] + cur_byte_size
-                        buckets[tp][-1].append(param)
-                    else:
-                        dtype2size[tp] = cur_byte_size
-                        buckets[tp].append([param])
-        seq_buckets: List[List[torch.nn.Parameter]] = []
-        for dtype in buckets:
-            if not self._async:
-                assert len(buckets[dtype]) == 1, \
-                    f"internal error: synchronized reducer only needs one bucket, but got {len(buckets[dtype])}"
-            for bucket in buckets[dtype]:
-                seq_buckets.append(bucket)
+                    seq_buckets.append([param])
+                    last_bucket_size = cur_byte_size
 
         # step 2: build meta data for the offset of each bucket
         # the start of each bucket will be padded to the next multiple of `len(self.ranks)`
@@ -485,8 +593,11 @@ class Reducer:
         starts, stops = [], []
         for params in seq_buckets:
             starts.append(buffer_length)
-            numel = sum(p.numel() for p in params)
-            padding = (len(self._ranks) - numel % len(self._ranks)) % len(self._ranks)
+            numel = sum(_aligned_nelement(p.nelement(), p.element_size(), self._align_size) for p in params)
+            # this pad is for zero, which needs numels in each Bucket can be divided by the number of ranks in this group * _align_size
+            # so that each chunck during zero can be divided by _align_size
+            align_nelements = self._align_size // params[0].element_size() * len(self._ranks)
+            padding = (align_nelements - numel % align_nelements) % len(self._ranks)
             buffer_length += numel + padding
             stops.append(buffer_length)
 
@@ -496,7 +607,7 @@ class Reducer:
             (buffer_length,), dtype=self._params[0].dtype,
             device=torch.cuda.current_device(), requires_grad=False)
         # parameter buffer
-        self._contiguous_params: torch.Tensor = torch.empty(
+        self._contiguous_params: torch.Tensor = torch.zeros(
             (buffer_length,), dtype=self._params[0].dtype,
             device=torch.cuda.current_device(), requires_grad=False)
 
@@ -509,7 +620,8 @@ class Reducer:
                 with torch.no_grad():
                     self._contiguous_params[ofst:ofst+param.numel()].copy_(param.data.view(-1))
                     param.data = self._contiguous_params[ofst:ofst+param.numel()].view(param.size())
-                ofst += param.numel()
+                aligned_nelements = _aligned_nelement(param.nelement(), param.element_size(), self._align_size)
+                ofst += aligned_nelements
             # initialize buckets
             bucket = Bucket(
                 params,
@@ -521,10 +633,14 @@ class Reducer:
                 self._zero,
                 self._zero_subgroup,
                 self._zero_crossgroup,
+                self._zero_use_reduce_scatter,
+                self._align_size,
             )
             buckets.append(bucket)
         torch.cuda.empty_cache()
+
         # make it in reverse order as the backward happens from tail to head
+        # it is not important but may be helpful for waiting cuda stream to finish
         self._buckets: List[Bucket] = list(reversed(buckets))
         assert len(self._buckets) > 0, (
             f"Find {len(self._params)} parameters in the reducer. "

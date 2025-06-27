@@ -141,7 +141,6 @@ class AutoDistConfig:
                  nproc=1,
                  ignore_small_tensor_threshold=1,
                  verbose=False,
-                 priority='time',
                  re_profile=False,
                  pipeline=False,
                  pipeline_pivots='',
@@ -167,7 +166,6 @@ class AutoDistConfig:
         self.opt_transient_coef = opt_transient_coef
         self.is_train = is_train
         self.mesh_desc = MeshDesc(mesh_row, mesh_col)
-        self.ngpus = self.mesh_desc.row * self.mesh_desc.col
         self.recompute_modules = recompute_modules
         # from GB to Byte
         self.memory_constraint = int(memory_constraint * 1024 * 1024 * 1024)
@@ -179,7 +177,6 @@ class AutoDistConfig:
 
         self.ignore_small_tensor_threshold = ignore_small_tensor_threshold
         self.verbose = verbose
-        self.priority = priority
         self.re_profile = re_profile
         self.pipeline = pipeline
         self.pipeline_pivots = pipeline_pivots
@@ -260,3 +257,7 @@ class AutoDistConfig:
 
     def __repr__(self):
         return f'{self.__class__.__name__} {self.__dict__}'
+
+    @property
+    def ngpus(self):
+        return self.mesh_desc.ngpus

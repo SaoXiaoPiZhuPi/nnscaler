@@ -73,6 +73,10 @@ class _DeviceGroup:
             self.groups[rank_bits] = torch.distributed.new_group(
                 list(ranks), timeout=_LARGE_TIMEOUT)
         return self.groups[rank_bits]
+    
+    def get_ranks(self, group):
+        keys = [k for k, v in self.groups.items() if v == group]
+        return keys[0]
 
     def long_barrier(self):
         """

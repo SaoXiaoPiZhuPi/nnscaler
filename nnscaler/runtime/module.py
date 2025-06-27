@@ -12,13 +12,16 @@ from collections import defaultdict
 import torch
 import torch.distributed as dist
 
-from nnscaler.graph.parser.fx.parser import FxModuleParser
+from nnscaler.graph.parser import FxModuleParser
+
 from nnscaler.runtime.device import DeviceGroup
 from nnscaler.runtime.adapter.reducer import Reducer
 from nnscaler.runtime.executor import Executor
 from nnscaler.runtime.gnorm import ParamsInfo
-from nnscaler.flags import CompileFlag
 from nnscaler.runtime.utils import microbatches
+
+from nnscaler import __version__ as runtime_version
+from nnscaler.flags import CompileFlag
 from nnscaler.utils import accum_mode
 
 if TYPE_CHECKING:
@@ -234,6 +237,11 @@ class CubeModule(torch.nn.Module):
         reducer_pids = set()
         for reducer in self._reducers:
             param_names = [paramid2name[id(p)] for p in reducer.params]
+            # we should use `parameters_for_optimizer` here since calculating gnorm
+            # is ahead of the optimizer step. When ZeRO is enabled, each device only
+            # maintains a subset of the parameters. As a result, `param_names` may not
+            # align with the value of `reducer.parameters_for_optimizer()`, only part of
+            # parameters assigned to a bucket will be shown in `reducer.parameters_for_optimizer()`.
             params_info = ParamsInfo(reducer.ranks, reducer.parameters_for_optimizer(),
                                      param_names, reducer.zero_ngroups)
             params_info_for_gnorm.append(params_info)
@@ -759,11 +767,18 @@ class ParallelModule(CubeModule):
     EXTRA_STATE_KEY = 'CUBE_EXTRA_STATE'
     # the rank of the module, will be assigned in the generated subclasses
     rank: int
+    # the runtime version of the module when it is generated, will be assigned in the generated subclasses
+    runtime_version: str
 
     def __init__(self):
         if self.__class__  == ParallelModule:  # not init via super().__init__()
             raise RuntimeError(f"ParallelModule should not be initialized directly. Please derive it first")
 
+        rv = getattr(self, 'runtime_version', None)
+        if rv != runtime_version:
+            _logger.warning(
+                f"Runtime version mismatch: {rv} vs {runtime_version}. "
+            )
         super().__init__()
         # this is used to allow multiple sync_grad() calls
         self._sync_grad_required = False
@@ -857,6 +872,7 @@ class ParallelModule(CubeModule):
         """
         if self._sync_grad_required:
             self._sync_grad_required = False  # mark sync_grad() has been called
+            print(f"reducer num:{len(self._reducers)}")
             for reducer in self._reducers:
                 reducer.sync_grads()
 
@@ -900,6 +916,9 @@ class ParallelModule(CubeModule):
         accum_idx = 0
         def cube_scale(ins, outs, grads):
             nonlocal accum_idx
+
+            # print(f'is_dummy_batch:{is_dummy_batch},accum_idx:{accum_idx},is_dummy_batch and accum_idx:{is_dummy_batch and accum_idx},len(is_dummy_batch):{len(is_dummy_batch)}')
+
             if is_dummy_batch and accum_idx >= len(is_dummy_batch):
                 raise RuntimeError(
                     f"Expected {len(is_dummy_batch)} number of micro-batches, but got more than it."
@@ -956,18 +975,19 @@ class ParallelModule(CubeModule):
         self._sync_grad_required = False
         sample_count = len(samples)
         dataloader = microbatches(samples, cycle=False)
-
+        # print(f'dataloader length:{len(dataloader)}')
         if self.use_scheduler:
+            # print(f'len(samples):{len(samples)}, self.nmicros_per_scheduler_step:{self.nmicros_per_scheduler_step}')
             if len(samples) != self.nmicros_per_scheduler_step:
                 raise ValueError(f"Expected {self.nmicros_per_scheduler_step} samples, but got {sample_count}")
             # only one step, so begin/end are both True
-            with accum_mode(begin=True, end=True):
-                return self._train_step(dataloader)
+            # with accum_mode(begin=True, end=True): 
+            return self._train_step(dataloader)
         else:
             outputs = []
             for idx in range(sample_count):
-                with accum_mode(begin=(idx==0), end=(idx==sample_count-1)):
-                    output = self._train_step(dataloader)
+                # with accum_mode(begin=(idx==0), end=(idx==sample_count-1)):
+                output = self._train_step(dataloader)
                 outputs.append(output)
             return outputs
 
@@ -1078,9 +1098,10 @@ class ParallelModule(CubeModule):
                 pstart, pend = 0, 0
                 for param in bucket.params:
                     pstart = pend
-                    pend += param.numel()
+                    pend = pstart + bucket.get_aligned_numel(param)
+                    pend_without_padding = pstart + param.numel()
                     model_idx = model_params_id.index(id(param))
-                    model_idx2opt_idx[model_idx] = (opt_idx, pstart, pend, param.shape)
+                    model_idx2opt_idx[model_idx] = (opt_idx, pstart, pend_without_padding, param.shape)
                 assert len(bucket._contiguous_params.shape) == 1
                 opt_idx2ranks[opt_idx] = (sub_ranks, bucket._contiguous_params.shape[0])
                 opt_idx += 1

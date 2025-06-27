@@ -160,6 +160,9 @@ def pas_hybrid(graph: IRGraph, cfg: 'ComputeConfig'):
     """
     if not cfg.use_end2end:
         raise ValueError("Hybrid policy only supports end2end module")
+    if cfg.use_async_reducer:
+        raise ValueError("Hybrid policy does not support async reducer")
+
     ngpus: int = cfg.plan_ngpus
     nstages = cfg.pas_config.get('pipeline_nstages', cfg.plan_ngpus)
     nmicros = cfg.pas_config['pipeline_nmicros']
@@ -209,9 +212,11 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
 
     # optional parameters
     explore_pipeline = pas_cfg.get('explore_pipeline', False)
-    # explore_pipeline = pas_cfg.get('explore_pipeline', True)
     if explore_pipeline and not cfg.use_end2end:
         raise ValueError("explore_pipeline cannot be enabled if use_end2end is False")
+    # if explore_pipeline and cfg.use_async_reducer:
+    #     raise ValueError("explore_pipeline cannot be enabled if use_async_reducer is True")
+
     pipeline_scheduler = pas_cfg.get('pipeline_scheduler', '1f1b')
     if pipeline_scheduler != '1f1b':
         raise ValueError(f"Only 1f1b scheduler is supported in autodist.")
@@ -230,16 +235,12 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
     use_bf16 = pas_cfg.get('use_bf16', use_memory_efficient_bf16)
     re_profile = pas_cfg.get('re_profile', False)
     verbose = pas_cfg.get('verbose', False)
-    
-    priority = pas_cfg.get('priority', 'time')
-
-
     load_plan_path = pas_cfg.get('load_plan_path', None)
     save_plan_path = pas_cfg.get('save_plan_path', None)
     partition_constraints_path = pas_cfg.get('partition_constraints_path', '')
     recompute_modules = pas_cfg.get('recompute_modules', '')
-    pipeline_pivots = pas_cfg.get('pipeline_pivots', 'Linear')
-    use_apex_fused_adam_v2 = pas_cfg.get('use_apex_fused_adam_v2', False)
+    pipeline_pivots = pas_cfg.get('pipeline_pivots', '')
+    use_apex_fused_adam_v2 = pas_cfg.get('use_apex_fused_adam_v2', True)
     parallel_profile = pas_cfg.get('parallel_profile', True)
     transient_mem_coef = pas_cfg.get('transient_mem_coef', 2)
 
@@ -295,7 +296,6 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
         opt_resident_coef=opt_resident_coef,
         opt_transient_coef=opt_transient_coef,
         verbose=verbose,
-        priority=priority,
         re_profile=re_profile,
         world_size=cfg.runtime_ngpus,
         recompute_modules=recompute_modules,
@@ -303,8 +303,6 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
         zero_ngroups=zero_ngroups,
         load_plan_path=load_plan_path,
         save_plan_path=save_plan_path,
-        # solver='ilp',
-        profile_dir='/data/haiqwa/zevin_nfs/andy/Auto-Parallelization/nnscaler_group1/qinghe/examples/comm_profiler',
         pipeline=explore_pipeline,
         pipeline_pivots=pipeline_pivots,
         parallel_profile=parallel_profile,

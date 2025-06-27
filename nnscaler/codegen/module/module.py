@@ -2,7 +2,8 @@
 #  Licensed under the MIT License.
 
 from typing import List, Optional, Tuple, Dict, Any
-import more_itertools
+import torch
+import more_itertools 
 import logging
 import copy
 import torch
@@ -10,7 +11,7 @@ import numpy as np
 import inspect
 
 from nnscaler.ir.cten import IRCell
-from nnscaler.ir.tensor import IRSubTensor
+from nnscaler.ir.tensor import IRFullTensor, IRSubTensor
 from nnscaler.ir.operator import IRBpOperation, IRDataOperation, IRFwOperation
 from nnscaler.ir.adapter import IRWeightReducer, IRAdapter
 from nnscaler.ir.adapter.prim import CollectivePrim
@@ -29,6 +30,7 @@ from nnscaler.codegen.module.autograd import AutogradAdapterCodeGen
 from nnscaler.codegen.lifecycle import LifeCycle
 
 from nnscaler.flags import CompileFlag
+from nnscaler import __version__ as runtime_version
 
 
 _logger = logging.getLogger(__name__)
@@ -100,8 +102,9 @@ class ModuleCodeGen(FuncEmission):
         super().__init__()
         self.execplan: ExecutionPlan = execplan
         self.devices: Tuple[int] = tuple(sorted(execplan.graph.device))
-        if self.devices != tuple(range(len(self.devices))):
-            raise ValueError(f'device must be consecutive')
+        # qinghe comment this
+        # if self.devices != tuple(range(len(self.devices))):
+        #     raise ValueError(f'device must be consecutive')
 
         if scale_ndevs is not None:
             _logger.warning("scale_ndevs is deprecated, please use runtime_ndevs instead")
@@ -118,17 +121,19 @@ class ModuleCodeGen(FuncEmission):
         self.enable_dp = self.runtime_ndevs > len(self.devices)
 
         self.init_code: List[str] = [
-            '\n\n########## Generated Model Code ###########',
+            '########## Generated Model Code ###########',
             'from typing import *',
             'from pathlib import Path',
             'import torch', 'import torch.utils.checkpoint as ckpt',
-            'import nnscaler', 'import _operator', 'from numpy import inf', 'import builtins', '', '']
+            'import nnscaler', 'import _operator', 'from numpy import inf', 'import builtins', '',
+            f'runtime_version = {runtime_version!r}', '', ''
+        ]
 
         if CompileFlag.use_nnfusion:
             self.init_code.extend(['import nnfusion', ''])
 
         # customized op code
-        for _, op_impl in CustomizedOps.kOpCodeDef.items():
+        for op_impl in set(CustomizedOps.kOpCodeDef.values()):
             # self.init_code.append('@torch.jit.script')
             self.init_code.append(op_impl)
             self.init_code += ['']
@@ -163,8 +168,14 @@ class ModuleCodeGen(FuncEmission):
                     assert param not in all_params, \
                         f'detected a parameter {param} in multiple reducers on device {device}'
                 all_params.update(reducer.inputs())
-            # create a reducer for the rest parameters used for this device
-            rest_params = []
+            # create reducers for the rest parameters used for this device
+            # nnscaler's weights are either fully replicated or partitioned, which has been checked
+            # at graph/gener/gen.py/gen_weights.
+            # We decouple the replicated and partitioned weights to align with the calculation of
+            # gradient norm which uses the replicated number of each weight to make the global value
+            # correct.
+            rest_params_replicated = []
+            rest_params_partitioned = []
 
             def collect_rest_params(segment):
                 """Resursively collect parameters. Note parameters can be in sub-segments,
@@ -175,18 +186,22 @@ class ModuleCodeGen(FuncEmission):
                         if device not in ctensor.device: continue
                         if ctensor not in all_params:
                             # a same parameter can be consumed multiple times by different operators
-                            if ctensor not in rest_params:
-                                rest_params.append(ctensor)
+                            if ctensor.shape == ctensor.parent.shape:
+                                if ctensor not in rest_params_replicated:
+                                    rest_params_replicated.append(ctensor)
+                            else:
+                                if ctensor not in rest_params_partitioned:
+                                    rest_params_partitioned.append(ctensor)
                 for seg in segment.select(ntype=IRSegment, flatten=False):
                     collect_rest_params(seg)
 
             collect_rest_params(graph)
-            if len(rest_params) == 0:
-                continue
             # create reducer and append to the execution
-            reducer = IRWeightReducer(rest_params)
-            reducer.device = device  # will be scaled in `self.scale`
-            self.execplan.at(device).append(reducer)
+            # device will be scaled in `self.scale`
+            for reducer in IRWeightReducer.from_weights(rest_params_replicated, device):
+                self.execplan.at(device).append(reducer)
+            for reducer in IRWeightReducer.from_weights(rest_params_partitioned, device):
+                self.execplan.at(device).append(reducer)
 
     def get_comm_groups(self):
         """
@@ -220,18 +235,32 @@ class ModuleCodeGen(FuncEmission):
         # scale communication groups
         graph = self.execplan.graph
         comm_groups = []
+        a = self.execplan.graph._mesh_size[0]
+        b = self.execplan.graph._mesh_size[1]
+        ngpus_per_node = torch.cuda.device_count()
         # communication groups for parameters that are in reducers
         reducers: List[IRWeightReducer] = graph.select(ntype=IRWeightReducer)
         for reducer in reducers:
-            ranks = more_itertools.flatten(list(range(device, self.runtime_ndevs, len(self.devices))) \
-                                           for device in reducer.device)
+            # ranks = more_itertools.flatten(list(range(device, self.runtime_ndevs, len(self.devices))) \
+            #                                for device in reducer.device)
+            ranks = []
+            for rank in reducer.device:
+                dp_group_begin_ranks=list(range(rank, self.runtime_ndevs, a * ngpus_per_node))
+                node_shifted_ranks=list(list(range(begin_rank, begin_rank + ngpus_per_node, b) for begin_rank in dp_group_begin_ranks))
+                for shifted_ranks in node_shifted_ranks:
+                    ranks += shifted_ranks
             ranks = tuple(sorted(ranks))
             comm_groups.append(ranks)
             # add comm groups for group ZeRO
             comm_groups.extend(_add_comm_for_group_zero(ranks))
         # communication groups for parameters that are outside reducers
         for device in self.devices:
-            ranks = list(range(device, self.runtime_ndevs, len(self.devices)))
+            # ranks = list(range(device, self.runtime_ndevs, len(self.devices)))
+            ranks=[]
+            dp_group_begin_ranks=list(range(device, self.runtime_ndevs, a * ngpus_per_node))
+            node_shifted_ranks=list(list(range(begin_rank, begin_rank + ngpus_per_node, b) for begin_rank in dp_group_begin_ranks))
+            for shifted_ranks in node_shifted_ranks:
+                ranks += shifted_ranks
             if len(ranks) > 1:
                 comm_groups.append(ranks)
                 # add comm groups for group ZeRO
@@ -243,7 +272,16 @@ class ModuleCodeGen(FuncEmission):
                 if isinstance(prim, CollectivePrim):
                     ranks = np.array(tuple(sorted(prim.kwargs['ranks'])), dtype=int)
                     for i in range(nreplica):
-                        shifted_ranks = tuple(ranks + i * len(self.devices))
+                        # shifted_ranks = tuple(ranks + i * len(self.devices))
+                        if i * b < ngpus_per_node:
+                            shift = i * b
+                        else:
+                            node_group_nreplica=(i * b) // ngpus_per_node
+                            ngroup_per_node= ngpus_per_node // b
+                            node_begin_shift = node_group_nreplica * (ngpus_per_node * a)
+                            intra_node_shift = b * (i - (node_group_nreplica * ngroup_per_node))
+                            shift = node_begin_shift + intra_node_shift
+                        shifted_ranks = tuple(ranks + shift)
                         shifted_ranks = tuple(int(rank) for rank in shifted_ranks)
                         if shifted_ranks not in comm_groups:
                             comm_groups.append(shifted_ranks)
@@ -252,7 +290,15 @@ class ModuleCodeGen(FuncEmission):
     def scale(self, node: IRCell, device: int) -> IRCell:
         if not self.enable_dp:
             return node
-        shift = (device // len(self.devices)) * len(self.devices)
+        # shift = (device // len(self.devices)) * len(self.devices)
+        a = self.execplan.graph._mesh_size[0]
+        b = self.execplan.graph._mesh_size[1]
+        ngpus_per_node = torch.cuda.device_count()
+        shifted_rank = device % (ngpus_per_node * a) 
+        node_begin_rank = (shifted_rank // ngpus_per_node) * ngpus_per_node
+        intra_node_shift = (shifted_rank - node_begin_rank) % b
+        device_map = node_begin_rank + intra_node_shift
+        shift = device - device_map
         if isinstance(node, IRAdapter):
             adapter = copy.copy(node)
             adapter._id = node.cid
@@ -283,7 +329,11 @@ class ModuleCodeGen(FuncEmission):
             ranks = list(node.device)
             scale_ranks = []
             for rank in ranks:
-                scale_ranks += list(range(rank, self.runtime_ndevs, len(self.devices)))
+                # scale_ranks += list(range(rank, self.runtime_ndevs, len(self.devices)))
+                dp_group_begin_ranks=list(range(rank, self.runtime_ndevs, a * ngpus_per_node))
+                node_shifted_ranks=list(list(range(begin_rank, begin_rank + ngpus_per_node, b) for begin_rank in dp_group_begin_ranks))
+                for shifted_ranks in node_shifted_ranks:
+                    scale_ranks += shifted_ranks
             reducer.device = sorted(scale_ranks)
             return reducer
         if isinstance(node, IRSegment) and node.isfw():
@@ -398,7 +448,15 @@ class ModuleCodeGen(FuncEmission):
         node_args: List[List[str]] = list()
         gen_nodes: List[IRCell] = list()
 
-        device_map = device % len(self.devices)
+        # device_map = device % len(self.devices)
+        a = self.execplan.graph._mesh_size[0]
+        b = self.execplan.graph._mesh_size[1]
+        ngpus_per_node = torch.cuda.device_count()
+        shifted_rank = device % (ngpus_per_node * a) 
+        node_begin_rank = (shifted_rank // ngpus_per_node) * ngpus_per_node
+        shift = (shifted_rank - node_begin_rank) % b
+        device_map = node_begin_rank + shift
+        
         sequence = self.execplan.seq(device_map)
         unrolled_seqs = []
         for node in sequence:
@@ -423,6 +481,18 @@ class ModuleCodeGen(FuncEmission):
         # initialize communication groups
         self.emit_comm_groups()
 
+        # we can have multiple segments in the graph when pipeline is enabled.
+        # Here we don't use tid to sort parameters
+        # because that assumption may be not true in the future,
+        # and the current implementation is clearer and more robust.
+        # key: parameter tensor, value: (segment index, node index)
+        param_first_used_pos: Dict[IRFullTensor, Tuple[int, int]] = {}
+        for i, n in enumerate(sequence):
+            if isinstance(n, IRSegment) and n.isfw():
+                for k, v in self._get_param_first_used_pos(n).items():
+                    if k not in param_first_used_pos:
+                        param_first_used_pos[k] = (i, v)
+
         # emit code
         for node in sequence:
             if isinstance(node, IRSegment):
@@ -433,7 +503,7 @@ class ModuleCodeGen(FuncEmission):
             elif isinstance(node, IRAdapter):
                 codes = self.emit_adapter(node, prefix_attr='self.', async_op=CompileFlag.async_comm)
             elif isinstance(node, IRWeightReducer):
-                self.init_reducer(node, device)
+                self.init_reducer(node, device, param_first_used_pos, as_parallel_module)
                 codes = self.emit_reducer(node)
             elif isinstance(node, IRBpOperation):
                 continue
@@ -468,9 +538,22 @@ class ModuleCodeGen(FuncEmission):
             graph_sched = self.execplan.graph.sched
             cb.insert_body(f'use_scheduler = {graph_sched is not None}')
             cb.insert_body(f'nmicros_per_scheduler_step = {graph_sched.nmicros if graph_sched is not None else 1}')
+
             if as_parallel_module:
                 cb.insert_body(f'rank = {device}')  # save rank in class level
-                with FunctionBlock(func_name='__init__', args=['self', 'init_params=True']) as ib:
+                # async_op, max_bucket_size_bytes and zero_use_reduce_scatter
+                # parameters are for testing purpose
+                # and will not expose to user
+                with FunctionBlock(func_name='__init__',
+                    args=[
+                        'self',
+                        'init_params=True',
+                        '*',
+                        f'async_op={CompileFlag.async_reducer}',
+                        f'max_bucket_size_bytes={CompileFlag.max_reducer_bucket}',
+                        f'zero_use_reduce_scatter={CompileFlag.zero_use_reduce_scatter}',
+                    ]
+                ) as ib:
                     ib.insert_body(self.model_init_statements)
                     ib.insert_body('')
                     ib.insert_body('self._post_init(init_params)')
@@ -672,15 +755,24 @@ class ModuleCodeGen(FuncEmission):
                 self.init_attributes(sub_node)
         return
 
-    def init_reducer(self, node: IRWeightReducer, device: int) -> None:
+    def init_reducer(self,
+        node: IRWeightReducer,
+        device: int,
+        param_first_used_pos: Dict[IRFullTensor, int],
+        as_parallel_module: bool = True,
+    ) -> None:
         """
         Emit code to initialize involved reducer objects in `__init__`.
 
         The fields storing intermediate codes that are populated by this method:
         -   `model_init_statements`
         """
-        max_nbytes = CompileFlag.max_reducer_bucket
-        async_op = CompileFlag.async_reducer
+        # when parallel module is used,
+        # `max_bucket_size_bytes` and `async_op` are passed as arguments
+        max_nbytes = CompileFlag.max_reducer_bucket if not as_parallel_module else 'max_bucket_size_bytes'
+        async_op = CompileFlag.async_reducer if not as_parallel_module else 'async_op'
+        zero_use_reduce_scatter = CompileFlag.zero_use_reduce_scatter if not as_parallel_module else 'zero_use_reduce_scatter'
+
         zero = CompileFlag.use_zero
         zero_ngroups = CompileFlag.zero_ngroups
         reduce_op = f"'{CompileFlag.reducer_op}'"
@@ -689,6 +781,7 @@ class ModuleCodeGen(FuncEmission):
             "{reducer} = nnscaler.runtime.adapter.Reducer("
             "ranks={ranks}, reduce_op={reduce_op}, "
             "async_op={async_op}, zero={zero}, max_bucket_size_bytes={max_nbytes}, "
+            "zero_use_reduce_scatter={zero_use_reduce_scatter}, "
             "zero_ngroups={zero_ngroups})"
         )
         reducer_add = 'self.add_reducer({reducer})'
@@ -700,9 +793,16 @@ class ModuleCodeGen(FuncEmission):
         ranks = list(sorted(node.device))
         init_code = reducer_init.format(
             reducer=reducer_name, ranks=ranks, reduce_op=reduce_op,
-            async_op=async_op, zero=zero, max_nbytes=max_nbytes, zero_ngroups=zero_ngroups)
+            async_op=async_op, zero=zero, max_nbytes=max_nbytes,
+            zero_ngroups=zero_ngroups, zero_use_reduce_scatter=zero_use_reduce_scatter
+        )
         self.model_init_statements.append(init_code)
-        weights = [self.tensor_name(t, prefix_attr='self.') for t in weights]
+        # sort weights by first used time (which is gradient all-reduce time in reverse order)
+        # so that weights with similar gradient all-reduce time are bucketed together
+        weights = [
+            self.tensor_name(t, prefix_attr='self.')
+            for t in sorted(weights, key=lambda t: param_first_used_pos[t.parent])
+        ]
         for weight in weights:
             add_param_code = add_param.format(reducer=reducer_name, weight=weight)
             self.model_init_statements.append(add_param_code)
@@ -862,6 +962,21 @@ class ModuleCodeGen(FuncEmission):
         )
 
         return codes
+
+    def _get_param_first_used_pos(self, segment: IRSegment) -> Dict[IRFullTensor, int]:
+        """
+        Get the first used node index of each parameter in the segment.
+        """
+        # get all the parameters in the segment
+        first_used_pos: Dict[IRFullTensor, int] = {}
+
+        for i, node in enumerate(segment.nodes()):
+            # parameters are used as inputs of the node
+            for tin in IRSegment.get_objects_from_complex(node.inputs()):
+                if isinstance(tin, IRSubTensor) and tin.is_param() and tin.parent not in first_used_pos:
+                    first_used_pos[tin.parent] = i
+
+        return first_used_pos
 
     def clear(self):
         """

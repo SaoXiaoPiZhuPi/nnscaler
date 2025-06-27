@@ -57,11 +57,14 @@ class DimSplitEinops(GenericDistAlgo):
         If the partitioned number is 1, return the first hidden identitifer
         Otherwise, return the first hidden identifier whose length > 1
 
-        @param idx int: input/output index. Take the idx-th input tensor or (idx-ninputs)-th output
-        @param dim int: input dimension
+        Args:
+            idx (int): input/output index. Take the idx-th input tensor or (idx-ninputs)-th output
+            dim (int): input dimension
+            num (int): chunks to partition the dimension
 
-        @return identifier Optional[str]: annotated dimension identifier
-        @return reduction Optional[DimAnno.ReduceType]
+        Returns:
+            identifier (Optional[str]): annotated dimension identifier
+            reduction (Optional[DimAnno.ReduceType])
         """
         node: IRDimops = self.node
         eshapes = node.anno.inputs() + node.anno.outputs()
@@ -79,11 +82,13 @@ class DimSplitEinops(GenericDistAlgo):
         """
         Check whether the condition satisfies.
 
-        @param idx int: input/output index. Take the idx-th input tensor or (idx-ninputs)-th output tensor
-        @param dim Union[int, str]: tensor dimension or 'v', i.e., partition at value dimension.
-        @param num int: chunks to partition the dimension
+        Args:
+            idx (int): input/output index. Take the idx-th input tensor or (idx-ninputs)-th output tensor
+            dim (Union[int, str]): tensor dimension or 'v', i.e., partition at value dimension.
+            num (int): chunks to partition the dimension
 
-        @return satisfy bool: true if can be partitioned, elsewise false.
+        Returns:
+            satisfy (bool): true if can be partitioned, elsewise false.
         """
         assert all(isinstance(cond, int) for cond in [idx, num]), "expect int condition"
         assert isinstance(dim, int) or dim == 'v', f"expect dim to be int or 'v'"
@@ -158,12 +163,12 @@ class DimSplitEinops(GenericDistAlgo):
         ous = list()
         for split, otensor in zip(rule.outputs(), node.outputs()):
             ous.append(transform(otensor, split))
-        kwargs = rule.modifier()(node.kwargs, idx, dim, num)
 
         sub_nodes = list()
         for nid in range(num):
             inputs = [t[nid] for t in ins]
             outputs = [t[nid] for t in ous]
+            kwargs = rule.modifier()(node.kwargs, idx, dim, num, nid)
             sub_node: IRDimops = node.new(inputs, outputs, **kwargs)
             sub_node.infer_shape()
             sub_nodes.append(sub_node)
@@ -176,12 +181,12 @@ class DimSplitEinops(GenericDistAlgo):
         return the partitioning of the output tensor.
 
         Args:
-            idx int: the input index
-            dim int: the dimension to partition
-            num int: the number of partitions
+            idx (int): the input index
+            dim (int): the dimension to partition
+            num (int): the number of partitions
 
         Returns:
-            rule TransformRule: the transformation rule
+            rule (TransformRule): the transformation rule
         """
         node: IRDimops = self.node
         assert isinstance(dim, int) or dim == 'v', f"expect dim to be int or 'v'"
@@ -233,7 +238,7 @@ class DimSplitEinops(GenericDistAlgo):
                     )
                 otransform.append(DimopSplit.D(dims))
         # modifier
-        def modify(kwargs: Dict, idx: int, dim: int, num: int):
+        def modify(kwargs: Dict, idx: int, dim: int, num: int, pos: int):
             updated_kwargs = dict(**kwargs)
             if adim in updated_kwargs:
                 assert updated_kwargs[adim] % num == 0, \
@@ -275,19 +280,19 @@ def collect_split_info(node: IRDimops):
 
 def gen_partitions(node: IRFwOperation, ngpus: int, base: int = 2, depth: int = -1) -> List[IRFwOperation]:
     """
-    Generate the partitioned nodes of the given node. Each node in the returned list is an
-    partition instance of a policy. For example, if the input node is a matmul with shape
+    Generate the partitioned nodes of the given node. Each node in the returned list is a possible partition
+    instance of a policy in one of the devices. For example, if the input node is a matmul with shape
     (1024, 4096), (4096, 2048) -> (1024, 2048), the ngpus is 2, base is 2, then the returned
     list will contain 4 instances:
-        1. matmul with shape (1024, 4096), (4096, 2048) -> (1024, 2048)
-        2. matmul with shape (1024, 2048), (2048, 2048) -> (1024, 2048)
-        3. matmul with shape ( 512, 4096), (4096, 2048) -> ( 512, 2048)
-        4. matmul with shape (1024, 4096), (4096, 1024) -> (1024, 1024)
+        1. matmul with shape (1024, 4096), (4096, 2048) -> (1024, 2048), this means no partition, replicate on 2 gpus
+        2. matmul with shape ( 512, 4096), (4096, 2048) -> ( 512, 2048), partition first input first dimension
+        3. matmul with shape (1024, 2048), (2048, 2048) -> (1024, 2048), partition first input second dimension 
+        4. matmul with shape (1024, 4096), (4096, 1024) -> (1024, 1024), partition second input second dimension
 
     Args:
         node (IRFwOperation): the node to be partitioned
         ngpus (int): the number of gpus
-        base (int): the base of the division for the partitioning
+        base (int): the partition number at each generation step in breadth-first-search
         depth (int): the maximum depth of the search process, -1 for no limit
 
     Returns:
@@ -299,7 +304,7 @@ def gen_partitions(node: IRFwOperation, ngpus: int, base: int = 2, depth: int = 
     if base == 1:
         return [node]
 
-    def gen_hash(node: IRFwOperation) -> str: #署名+形状
+    def gen_hash(node: IRFwOperation) -> str:
         ret = node.signature
         for it in node.inputs():
             if not isinstance(it, IRTensor): continue
@@ -308,17 +313,17 @@ def gen_partitions(node: IRFwOperation, ngpus: int, base: int = 2, depth: int = 
 
     dq = deque()
     visited = set()
-    dq.append((node, ngpus, 0))  #广度优先搜索，保存(cur_node, cur_ngpus, cur_depth) 这样的三元组，cur_ngpus：当前剩余GPU，cur_depth搜索深度
+    dq.append((node, ngpus, 0))
     visited.add(gen_hash(node))
 
-    gen_nodes = [] #用于保存生成分区后的节点
+    gen_nodes = []
 
     while dq:
         cur_node, cur_ngpus, cur_depth = dq.popleft()
         gen_nodes.append(cur_node)
-        if depth != -1 and cur_depth >= depth: #如果当前搜索深度超过限制，则跳过
+        if (depth != -1 and cur_depth >= depth) or base > cur_ngpus:
             continue
-        split_info = collect_split_info(cur_node) #收集可切分信息，当前节点分割维度以及其他信息
+        split_info = collect_split_info(cur_node)
 
         for key, val in split_info.items():
             idx_1st, dim_1st, _ = val

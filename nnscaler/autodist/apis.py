@@ -2,7 +2,7 @@
 #  Licensed under the MIT License.
 
 from .spmd_solver import calc_optimal_spmd_plan, analysis_pretty_printer
-from .pipeline_solver import calc_optimal_pp_plan
+from .pipeline_solver import calc_optimal_pp_plan, calc_optimal_pp_plan_dp, calc_optimal_pp_plan_dp_max, calc_optimal_pp_plan_max_sum_dpsum,calc_optimal_pp_plan_max_dpsum
 from .autodist_config import AutoDistConfig
 from .model_graph import ModelGraph, estimate_mem_lower_bound
 from .descs import *
@@ -16,6 +16,7 @@ from nnscaler.graph.function.anchor import IRGraphAnchor
 from nnscaler.graph.function.pyfunc import IRPyFunc
 from nnscaler.graph.schedule.predefined import PredefinedSched
 
+import torch
 import json
 import os
 import logging
@@ -88,6 +89,7 @@ def calc_parallel_plan(graph: IRGraph,
     check_env(autodist_config)
 
     autodist_graph = ModelGraph(ir_graph=graph, autodist_config=autodist_config)
+    
     pre_estimate_mem(autodist_graph)
 
     recompute_groups = autodist_graph.recompute_groups
@@ -96,7 +98,14 @@ def calc_parallel_plan(graph: IRGraph,
     ]
 
     if autodist_config.pipeline:
-        pp_out = calc_optimal_pp_plan(autodist_graph, autodist_config)
+        start_time = time.time()
+        # pp_out = calc_optimal_pp_plan_dp_max(autodist_graph, autodist_config)
+        # pp_out = calc_optimal_pp_plan(autodist_graph, autodist_config)
+        # pp_out = calc_optimal_pp_plan_max_dpsum(autodist_graph, autodist_config) #遍历
+        pp_out = calc_optimal_pp_plan_max_sum_dpsum(autodist_graph, autodist_config) #动态规划
+
+        total_time = time.time() - start_time
+        print(f'PP求解总时间: {total_time}')
     else:
         pp_out = calc_optimal_spmd_plan(autodist_graph, autodist_config)
     pp_out.desc.recompute_groups = recompute_groups
@@ -120,10 +129,11 @@ def parallelize_graph(graph: IRGraph,
         search_out = calc_parallel_plan(graph, autodist_config)
         compile_cost_time = time.time() - compile_start_time
 
-        if autodist_config.save_plan_path:
-            _logger.info(f'save plan to {autodist_config.save_plan_path}')
-            with open(autodist_config.save_plan_path, 'w') as f:
-                json.dump(search_out.to_json(), f, indent=2)
+    #qinghe changes it
+    if autodist_config.save_plan_path:
+        _logger.info(f'save plan to {autodist_config.save_plan_path}')
+        with open(autodist_config.save_plan_path, 'w') as f:
+            json.dump(search_out.to_json(), f, indent=2)
 
     _logger.info(f'use plan with e2e time/s {1000 * search_out.e2e_time:.2f}ms')
     pp_desc = search_out.desc
@@ -140,35 +150,6 @@ def parallelize_graph(graph: IRGraph,
 
     # graph staging
     if len(pp_desc.spmd_descs) > 1:
-        #Some data that is uncommutable: IRObject
-        #These data is produced by IRPyFunc node: getitem, they are the successors of dataloader
-        #We need to add these nodes to every stages
-        add_nodes=[]
-        for dl in graph.select(ntype=IRDataOperation):
-            for out in dl.oobjs():
-                next_nodes=graph.consumers(out.parent)
-                assert isinstance(next_nodes, tuple), "outputs of node should be a tuple"
-                uncommutable_nodes=[]
-                for node in next_nodes:
-                    has_successor = any(sublist for sublist in graph.subseq(node))
-                    if not has_successor and isinstance(node,IRPyFunc):
-                        uncommutable_nodes.append(node)
-                add_nodes.append((out.parent,uncommutable_nodes))
-        
-        #copy and insert uncommutable_nodes to every beginning of the stage 
-        inserted_nodes=dict()
-        for sid,spmd_desc in enumerate(pp_desc.spmd_descs):
-            cid=list(spmd_desc.partition_descs.keys())[0] # the fist node_id in stage
-            spmd_node=cid2node[cid]      #the fist node in stage
-            ind=graph.nodes().index(spmd_node)   #the index of the node in graph.nodes()
-            for (out,nodes) in add_nodes:
-                stage_new_nodes=[]
-                for node in nodes:
-                    new_node=copy.copy(node)     #copy the node
-                    graph.insert(new_node,ind)    # insert it into the graph
-                    stage_new_nodes.append(new_node)     
-            inserted_nodes[sid]=stage_new_nodes #Recording every stage id and inserted nodes
-
         # add multiref for shared parameters across stages
         shared_param2stage_info = defaultdict(dict)
         for ftensor in graph.attributes():
@@ -222,7 +203,6 @@ def parallelize_graph(graph: IRGraph,
         stages = []
         for spmd_desc in pp_desc.spmd_descs:
             stage = []
-            stage.append(inserted_nodes[i][0]) # add the first inserted nodes in the stage
             for cid in spmd_desc.partition_descs:
                 if cid not in cid2node:
                     raise RuntimeError(f'node {cid} not found in {cid2node}, make sure the plan is correct')
@@ -269,16 +249,28 @@ def parallelize_graph(graph: IRGraph,
 
     # partition and assign nodes to devices
     # TODO(yizhu1): network topo aware device map
-    f= open("./log/allocation.txt", "w")
-    print("allocating nodes",file=f)
-    f.flush() 
+    graph._mesh_size = search_out.dp_group_mesh
+    groups = search_out.tp_groups
+    indices = search_out.indices
+    a, b = graph._mesh_size
+    ngpus_per_node = int(os.environ["LOCAL_WORLD_SIZE"]) 
+    dev_list = list()
+    for i in range(a):
+        dev_list += list(range(i * ngpus_per_node, i * ngpus_per_node + b))
+    print(f"dev_list:{dev_list}")
+
+    stage_ranks: Dict[int, List[int]] = {}
     offset = 0
+    for group_stages_id, tp_list in zip(indices, groups):
+        for i, stage_id in enumerate(group_stages_id):
+            tp_degree = tp_list[i]
+            stage_ranks[stage_id] = [dev_list[idx] for idx in range(offset, offset + tp_degree)]
+            offset += tp_degree
+    logging.info(f'stage_ranks:{stage_ranks}')
     for idx, (spmd_desc, stage) in enumerate(zip(pp_desc.spmd_descs, stages)):
-        cur_ngpus = spmd_desc.mesh_desc.ngpus
-        dev = [offset + i for i in range(cur_ngpus)]
+        dev = stage_ranks[idx]
         stage_info_str = f'stage {idx} on devices {dev} with mem {search_out.stage_mems[idx]:.2f} GB'
         _logger.info(f'\nautodist plan analysis for {stage_info_str}:\n\n{analysis_pretty_printer(spmd_desc.analysis)}')
-        offset += cur_ngpus
         for node in stage.nodes():
             if isinstance(node, IRFwOperation):
                 if isinstance(
@@ -303,7 +295,7 @@ def parallelize_graph(graph: IRGraph,
                     )
 
     for dl in graph.select(ntype=IRDataOperation):
-        replica(graph, dl, devs=list(range(autodist_config.mesh_desc.ngpus)))
+        replica(graph, dl, devs=graph.device)
 
     # apply 1f1b schedule
     if len(stages) > 1:

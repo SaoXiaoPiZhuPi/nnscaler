@@ -18,6 +18,7 @@ from nnscaler.ir.operator import IRFwOperation
 from nnscaler.graph.function.pyfunc import IRPyFunc
 from nnscaler.graph.function.anchor import IRGraphAnchor
 from nnscaler.graph.function.dimops import DimopSplit, IRDimops
+from .op_partition import OpPartition
 import nnscaler.resources
 
 from .autodist_config import AutoDistConfig
@@ -91,8 +92,6 @@ def _profile_nodes(nodes: List[IRFwOperation], db: ProfileDataBase, partition_de
         else:
             partition_nodes = [node]
         for partition_node in partition_nodes:
-            f = open(f'./log/profile_log_noderank{os.getenv("NODE_RANK")}_rank{torch.cuda.current_device()}.txt', 'a')
-            print(f'开始profile节点------------------------------------------------',file=f)
             profiled_metrics: ProfiledMetrics = db.profile(partition_node, override=re_profile)
             ret.append((partition_node.signature, db._serialize(partition_node), profiled_metrics))
     return ret
@@ -101,8 +100,7 @@ def _profile_nodes(nodes: List[IRFwOperation], db: ProfileDataBase, partition_de
 def _profile_graph(dilled_info: str, dev_id: int, partition_degree: int, re_profile: bool, comp_profile_path: str, result: multiprocessing.Queue):
     import dill
     torch.cuda.set_device(dev_id)
-    f = open(f'./log/profile_log_noderank{os.getenv("NODE_RANK")}_rank{dev_id}.txt', 'a')
-    print(f'开始位于GPU{dev_id}profiling,{partition_degree=}',file=f)
+
     id_state, dilled_graph = dill.loads(dilled_info)
     graph = IRGraph.from_dill(id_state, dilled_graph)
     db = ProfileDataBase()
@@ -116,13 +114,12 @@ def _profile_graph(dilled_info: str, dev_id: int, partition_degree: int, re_prof
 
 class CostDatabase:
 
-    def __init__(self, graph: IRGraph, config: AutoDistConfig):
+    def __init__(self, autodist_config:AutoDistConfig, graph: IRGraph, profile_dir: str, memory_granularity: int, ignore_small_tensor_threshold: int):
         self.comm_info = {}
 
         self.graph = graph
-        self.autodist_config = config
-
-        self.profile_dir = Path(config.profile_dir)
+        self.autodist_config = autodist_config #qinghe 添加参数autodist_config
+        self.profile_dir = Path(profile_dir)
         self.db = ProfileDataBase()
         self.comp_profile_path = self.profile_dir / 'comp'
         if not self.comp_profile_path.exists():
@@ -137,11 +134,17 @@ class CostDatabase:
             with open(comm_dir / fname, 'r') as f:
                 self.comm_info[fname] = json.load(f)
 
-        self.memory_granularity = self.autodist_config.memory_granularity
-        self.ignore_small_tensor_threshold = self.autodist_config.ignore_small_tensor_threshold
+        self.memory_granularity = memory_granularity
+        self.ignore_small_tensor_threshold = ignore_small_tensor_threshold
 
-    def profile_comp(self, partition_degree: int):
-        if self.autodist_config.parallel_profile:
+    def profile_comp(self, partition_degree: int, parallel_profile: bool, re_profile: bool):
+        def insert_profile_info(info: List[Tuple[str, str, ProfiledMetrics]]):
+            for sign, serialized, profiled_metrics in info:
+                _logger.debug(f'profiled {sign} in {serialized} with {profiled_metrics}')
+                if not self.db.exist_serialized(sign, serialized):
+                    self.db.insert(sign, serialized, profiled_metrics)
+
+        if parallel_profile:
             _logger.info('Profiling in parallel')
             # use spawn to make sure the profiling process is independent from each other
             # and the main process, this is also required by torch
@@ -149,21 +152,16 @@ class CostDatabase:
 
             results = mp_context.Queue()
             processes = []
-            _logger.info(f'torch.cuda.device_count:{torch.cuda.device_count()}, os.getenv("NODE_RANK"):{os.getenv("NODE_RANK")}, partition_degree:{partition_degree}')
-            # for i in range(int(os.getenv("NODE_RANK")) * torch.cuda.device_count(), (int(os.getenv("NODE_RANK")) + 1) * torch.cuda.device_count()):
             for i in range(torch.cuda.device_count()):
                 p = mp_context.Process(target=_profile_graph,
-                                       args=(self.graph.dumps(), i, partition_degree, self.autodist_config.re_profile, self.comp_profile_path, results))
+                                       args=(self.graph.dumps(), i, partition_degree, re_profile, self.comp_profile_path, results))
                 processes.append(p)
                 p.start()
 
             # put queue.get() before join to avoid deadlock
             for p in processes:
                 ret = results.get()
-                for sign, serialized, profiled_metrics in ret:
-                    _logger.debug(f'profiled {sign} in {serialized} with {profiled_metrics}')
-                    if not self.db.exist_serialized(sign, serialized):
-                        self.db.insert(sign, serialized, profiled_metrics)
+                insert_profile_info(ret)
             results.close()
 
             for p in processes:
@@ -171,7 +169,8 @@ class CostDatabase:
         else:
             _logger.info('Profiling in serial')
             node_to_profile = _filter_nodes(self.graph, self.db)
-            _profile_nodes(node_to_profile, self.db, partition_degree, self.autodist_config.re_profile)
+            ret = _profile_nodes(node_to_profile, self.db, partition_degree, re_profile)
+            insert_profile_info(ret)
 
         self.db.dump_ops(self.comp_profile_path, override=True)
 
@@ -210,12 +209,31 @@ class CostDatabase:
             memory_results[memory_type] = mem
         return memory_results
 
-    def get_mem_and_buffer(self, op_partition, is_train: bool, stage_num: int):
+    def get_mem_and_buffer(
+        self, 
+        op_partition, 
+        is_train: bool, 
+        stage_num: int, 
+        world_size: int, 
+        plan_ngpus: int, 
+        zero_stage: int, 
+        zero_ngroups: int, 
+        opt_resident_coef: float, 
+        opt_transient_coef: float
+    ) -> Tuple[int, int, int, int, int]:
         """
         Get the memory consumption and buffer memory consumption of a partition option.
 
         Args:
             op_partition: the partition option to be calculated
+            is_train: whether the partition is for training
+            stage_num: the number of stages
+            world_size: the total number of devices
+            plan_ngpus: the number of GPUs planned
+            zero_stage: the zero optimization stage
+            zero_ngroups: the number of zero optimization groups
+            opt_resident_coef: the coefficient for optimizer resident memory
+            opt_transient_coef: the coefficient for optimizer transient memory
 
         Returns:
             node_mem: the memory consumption of the partition option
@@ -226,55 +244,51 @@ class CostDatabase:
         """
         memory_results = self.get_mems(op_partition)
         activation_mem = memory_results['train']
-        if not self.autodist_config.zero_stage in [0, 1]:
-            raise RuntimeError(
-                f'invalid zero stage {self.autodist_config.zero_stage}')
+        if zero_stage not in [0, 1]:
+            raise RuntimeError(f'invalid zero stage {zero_stage}')
+
         # estimate optimizer memory consumption for training.
         # no gradient no memory consumption,
         # weight_mem should be 0 when require_grad is false.
         opt_resident_mem, opt_transient_mem = 0, 0
         if is_train and memory_results['param'] > 0:
-            if self.autodist_config.zero_stage == 0:
+            if zero_stage == 0:
                 weight_mem = memory_results['param']
             else:
                 # if zero-1 is used, we assume the full weight is distributed equally
                 # among all devices
                 weight_mem = self.query_single_mem(op_partition, 'full_weight')
-            opt_resident_mem = self.autodist_config.opt_resident_coef * weight_mem
-            opt_transient_mem = self.autodist_config.opt_transient_coef * weight_mem
-            if self.autodist_config.zero_stage == 1:
+            opt_resident_mem = opt_resident_coef * weight_mem
+            opt_transient_mem = opt_transient_coef * weight_mem
+            if zero_stage == 1:
                 if op_partition.is_replicated():
-                    assert self.autodist_config.world_size % self.autodist_config.ngpus == 0
-                    scale_factor = self.autodist_config.world_size // self.autodist_config.ngpus
-                    divisor = scale_factor // self.autodist_config.zero_ngroups
+                    assert world_size % plan_ngpus == 0, f'world_size {world_size} is not divisible by ngpus {plan_ngpus}'
+                    scale_factor = world_size // plan_ngpus
+                    divisor = scale_factor // zero_ngroups
                 else:
-                    assert self.autodist_config.world_size % self.autodist_config.zero_ngroups == 0
-                    divisor = self.autodist_config.world_size // self.autodist_config.zero_ngroups
+                    assert world_size % zero_ngroups == 0
+                    divisor = world_size // zero_ngroups
                 opt_resident_mem = opt_resident_mem // divisor
                 opt_transient_mem = opt_transient_mem // divisor
 
         # optimizer state + saved activation tensors for backward + param
         # + gradients + buffer tensors (has deduplicated with the saved tensors)
-        node_mem = opt_resident_mem + memory_results[
-            'train'] + 2 * memory_results['param'] + memory_results['buffer']
-        node_mem = node_mem + (stage_num - 1) * activation_mem \
-            if is_train else node_mem
-        node_buffer = max(memory_results.values()) \
-            if is_train else memory_results['infer']
+        node_mem = opt_resident_mem + memory_results['train'] + 2 * memory_results['param'] + memory_results['buffer']
+        node_mem = node_mem + (stage_num - 1) * activation_mem if is_train else node_mem
+        node_buffer = max(memory_results.values()) if is_train else memory_results['infer']
 
         if node_mem != 0:
-
             def to_mb(x):
                 return x / 1024 / 1024
 
             _logger.debug(
                 f'{op_partition.operator.ir_cell.cid}, {op_partition.ir_cell}, '
-                + f'node mem: {to_mb(node_mem)} MB, ' +
-                f'activation mem: {to_mb(activation_mem)} MB, ' +
-                f'optimizer transient mem: {to_mb(opt_transient_mem)} MB')
+                + f'node mem: {to_mb(node_mem)} MB, '
+                + f'activation mem: {to_mb(activation_mem)} MB, '
+                + f'optimizer transient mem: {to_mb(opt_transient_mem)} MB'
+            )
 
-        return node_mem, node_buffer, activation_mem, opt_transient_mem, memory_results[
-            'input']
+        return node_mem, node_buffer, activation_mem, opt_transient_mem, memory_results['input']
 
     def query_single_mem(self, obj, memory_type, round=True) -> int:
         """
@@ -340,6 +354,7 @@ class CostDatabase:
                         recompute: bool = False,
                         is_train: bool = True):
         profiled_metrics = self.query_profiled_metrics(op_or_partition)
+        
         if not is_train:
             return profiled_metrics.fw_span / 1000
         if recompute:
@@ -348,23 +363,31 @@ class CostDatabase:
         else:
             return (profiled_metrics.fw_span + profiled_metrics.bw_span) / 1000
 
-    def primitive_to_cost(self, dev_num: int, byte_size: int, primitive: str):
+    def primitive_to_cost(self, dev_num: int, byte_size: int, primitive: str, dp_comm_mesh: Tuple[int, int]): 
         if byte_size == 0:
             return 0
         size_mb = byte_size / 1024 / 1024
-        device_setting = f'intra_{dev_num}.json'
+        (nnodes, _) = dp_comm_mesh
+        if nnodes == 1:
+            device_setting = f'intra_{dev_num}.json'
+        elif nnodes > 1:
+            device_setting = f'inter_{dp_comm_mesh}.json'
+        else:
+            raise ValueError(f'Invalid dp_comm_mesh: {dp_comm_mesh} provided.')
         sizes_in_mb, times_in_s = self.comm_info[device_setting][primitive]
         est_time = _piecewise_estimator(sizes_in_mb, times_in_s, size_mb)
         assert est_time >= 0, f'{primitive} {dev_num} comm size: {size_mb} MB, est time: {est_time} s'
         return est_time
 
-    def calc_weight_update_time(self, cur_partition) -> float:
+    def calc_weight_update_time(self, cur_partition: OpPartition, dp_group_mesh: Tuple[int, int]) -> float:
         """
         Calculate communication cost for weight update. Currently cost is evaluated
         by allreduce.
 
         Args:
             cur_partition: one partition option of the operator
+            dp_group_mesh: the mesh shape of a dp_group: (a,b).  a*b =plan_ngpus
+            a means the number of nodes, b means ngpus per node.
 
         Returns:
             communication cost in seconds
@@ -372,25 +395,21 @@ class CostDatabase:
         # partition_dims and partition_nums represent a concrete partition option of a node
         # if the element in partition_dims is -1, it means the node is replicated.
         # currently, len of partition_dims is 1, we only support partitioning one dimension
-        f = open(f'./log/profile_comm_log_rank{torch.cuda.current_device()}.txt', 'a')
         partition_dims = cur_partition.partition_dims
         partition_nums = cur_partition.partition_nums
-        print(f'{partition_dims=},{partition_nums=}',file=f)
-
         # TODO: remove this assertion, support partitioning multiple dimensions
         assert len(
             partition_dims
         ) == 1, f'expect len(partition_dims) == 1, got {len(partition_dims)}'
+
         full_weight_mem = self.query_single_mem(cur_partition,
                                                 'full_weight',
                                                 round=False)
         partitioned_weight_mem = self.query_single_mem(cur_partition,
                                                        'param',
                                                        round=False)
-
-        
         if partitioned_weight_mem == 0:
-            return 0
+            return 0, 0,(-1,-1)
         if full_weight_mem % partitioned_weight_mem == 0:
             mem_weight_spatial_num = full_weight_mem // partitioned_weight_mem
         else:
@@ -405,17 +424,43 @@ class CostDatabase:
         all_num = 1
         for num in cur_partition.partition_nums:
             all_num *= num
-        weight_update_num = all_num // (mem_weight_spatial_num * replica_num)
-        if weight_update_num == 1:
-            return 0
-        
-        print(f'{full_weight_mem=},{partitioned_weight_mem=},{mem_weight_spatial_num=},{replica_num=}',file=f)
+        weight_update_num = all_num // (mem_weight_spatial_num * replica_num) 
+        cfg = self.autodist_config
+        scale_factor=(cfg.world_size // cfg.ngpus)
 
-        comm_time = self.primitive_to_cost(dev_num=weight_update_num,
-                                           primitive='all reduce',
-                                           byte_size=partitioned_weight_mem)
+        if weight_update_num == 1 and scale_factor == 1:
+            return 0,0,(-1,-1)
+        (a, b) = dp_group_mesh
+        weight_replica_num = all_num // mem_weight_spatial_num
+        local_world_size = int(os.environ["LOCAL_WORLD_SIZE"]) 
+        nnodes = cfg.world_size // local_world_size
+        dp_comm_ngpus_per_node = local_world_size // b * weight_replica_num
+        dp_comm_nnodes = nnodes // a
+        dp_comm_mesh = (dp_comm_nnodes, dp_comm_ngpus_per_node)
+        dp_size = float(partitioned_weight_mem)
 
-        return comm_time
+        # size_mb = partitioned_weight_mem / 1024 / 1024
+        # (nnodes, _) = dp_comm_mesh
+        # if nnodes == 1:
+        #     device_setting = f'intra_{weight_update_num * scale_factor}.json'
+        # elif nnodes > 1:
+        #     device_setting = f'inter_{dp_comm_mesh}.json'
+        # else:
+        #     raise ValueError(f'Invalid dp_comm_mesh: {dp_comm_mesh} provided.')
+        # sizes_in_mb1, times_in_s1 = self.comm_info[device_setting]['reduce scatter']
+        # sizes_in_mb2, times_in_s2 = self.comm_info[device_setting]['all gather']
+        # rs_time = size_mb / sizes_in_mb1[-1] * times_in_s1[-1]
+        # ag_time = size_mb / sizes_in_mb2[-1] * times_in_s2[-1]
+
+        rs_time = self.primitive_to_cost(dev_num=weight_update_num * scale_factor,
+                                           primitive='reduce scatter',
+                                           byte_size=partitioned_weight_mem ,dp_comm_mesh=dp_comm_mesh)
+        ag_time = self.primitive_to_cost(dev_num=weight_update_num * scale_factor,
+                                           primitive='all gather',
+                                           byte_size=partitioned_weight_mem ,dp_comm_mesh=dp_comm_mesh)
+        comm_time = rs_time + ag_time
+        # logging.info(f'dev_num:{weight_update_num * scale_factor},byte_size:{partitioned_weight_mem/1024/1024},dp_comm_mesh:{dp_comm_mesh},comm_time:{comm_time}')
+        return comm_time, dp_size , dp_comm_mesh
 
     def estimate_comm_cost(self, src_p, dst_p, is_forward) -> float:
         """
@@ -431,10 +476,8 @@ class CostDatabase:
         Returns:
             communication cost in seconds
         """
-        f = open(f'./log/profile_comm_log.txt', 'a')
-        print(f'{src_p=},{dst_p=},{is_forward=}',file=f)
         assert len(src_p.partition_nums) == 1 and len(dst_p.partition_nums) == 1
-
+    
         def comm_cost(tensor: IRTensor, num_devices: int, src_split: DimopSplit,
                       dst_split: DimopSplit, dst_replica: bool,
                       is_forward: bool):
@@ -460,7 +503,7 @@ class CostDatabase:
             byte_size = tensor.byte_size()
 
             def helper(primitive: str):
-                return self.primitive_to_cost(num_devices, byte_size, primitive)
+                return self.primitive_to_cost(num_devices, byte_size, primitive, (1, num_devices))
 
             # R: replicated, V: value split, D: dim split
             if src_split.isR():
@@ -533,7 +576,6 @@ class CostDatabase:
                         # then no backward communication.
                         cost += 0.0
                     else:
-                        print(f'{src_t=},{src_p_num=}',file=f)
                         cost += comm_cost(
                             src_t, src_p_num,
                             rule_src.outputs()[i]

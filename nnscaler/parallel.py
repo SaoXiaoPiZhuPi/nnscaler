@@ -1,6 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
+import time
 from enum import Enum
 from functools import partial
 import types
@@ -28,8 +29,9 @@ from nnscaler.graph import IRGraph
 from nnscaler.graph import parser
 from nnscaler.graph.function.anchor import IRGraphAnchor
 from nnscaler.graph.function.pyfunc import IRPyFunc
+from nnscaler.graph.function.wrapnn import convert_to_wrapnn, wrapnn
 from nnscaler.graph.gener.gen import IRAdapterGener
-from nnscaler.graph.parser.fx.parser import FxModuleParser
+from nnscaler.graph.parser import FxModuleParser
 from nnscaler.graph.schedule.predefined import PredefinedSched
 from nnscaler.graph.schedule.schedplan import SchedulePlan
 
@@ -78,6 +80,11 @@ class ComputeConfig:
 
     use_zero: bool = False
     zero_ngroups: int = 1
+    # whether to use reduce scatter for zero
+    # Please note
+    # 1. this only works when `use_zero` is True and `zero_ngroups` is 1.
+    # 2. In some cases, it can introduce parity issue. So use it with caution.
+    zero_use_reduce_scatter: bool = True
 
     # whether the generated code is for inference only
     inference_only: bool = False
@@ -87,6 +94,15 @@ class ComputeConfig:
     #  2. the first return value of `module.forward` must be the loss
     #  which must be a scalar tensor
     use_end2end: bool = False
+
+    # whether to use async reducer
+    # if True, the gradient all-reduce will be async,
+    # This only works when the `use_end2end` is `True` for now.
+    use_async_reducer: bool = False
+    # the maximal reducer weight bytes for one allreduce in megabytes
+    # It is also effective for sync reducer.
+    # None/0 means using the default value. (25MB for async, no limit for sync)
+    reducer_bucket_cap_mb: Optional[float] = None
 
     # PAS policy settings
     # you can also put any other settings that can affect code generation here.
@@ -139,6 +155,15 @@ class ComputeConfig:
             logger.warning(f"use_zero is False, but zero_ngroups is {self.zero_ngroups}. Will set zero_ngroups to 1.")
             # have to use __setattr__ for frozen dataclass
             super().__setattr__('zero_ngroups', 1)
+
+        if self.reducer_bucket_cap_mb and self.reducer_bucket_cap_mb < 0:
+            raise ValueError(f"reducer_bucket_cap_mb {self.reducer_bucket_cap_mb} should not be negative.")
+
+        # TODO: Please note in current implementation of Bucket,
+        # zero_use_reduce_scatter still works when zero_ngroups > 1 in sync mode
+        # Let's hide this feature for now for consistency.
+        if self.use_zero and self.zero_use_reduce_scatter and self.zero_ngroups != 1:
+            raise ValueError("zero_use_reduce_scatter is only supported when zero_ngroups is 1.")
 
     def apply_pipeline_scheduler(
             self,
@@ -271,6 +296,7 @@ class ComputeConfig:
         This is only for backward compatibility, and will be removed in future
         and can use `==` when we save dict version of ComputeConfig to file.
         """
+        return True # qinghe 改的此处，想避免output文件夹非空出错，更容易利用gencode.py直接训
         try:
             return a == b
         except AttributeError:
@@ -294,9 +320,13 @@ def _flags(flags, /, **kwargs):
 def _compile_flags(compute_config: ComputeConfig):
     return _flags(
         CompileFlag,
-        async_reducer=False, reducer_op='sum', async_comm=False,
+        async_reducer=compute_config.use_async_reducer, reducer_op='sum',
+        max_reducer_bucket=int(compute_config.reducer_bucket_cap_mb * 1024 * 1024)
+                if compute_config.reducer_bucket_cap_mb else None,
+        async_comm=False,
         use_zero=compute_config.use_zero,
         zero_ngroups=compute_config.zero_ngroups,
+        zero_use_reduce_scatter=compute_config.zero_use_reduce_scatter,
         trace_strategy=compute_config.trace_strategy,
     )
 
@@ -317,7 +347,7 @@ def _to_cpu(val: Any):
         return {_to_cpu(t) for t in val}
     if isinstance(val, torch.Tensor):
         requires_grad = val.is_floating_point() or val.is_complex()
-        return val.cpu().requires_grad_(requires_grad)
+        return val.detach().clone().cpu().requires_grad_(requires_grad)
     return val
 
 
@@ -741,12 +771,15 @@ def _gencode(
             origin_shared_param_names=get_shared_params(module),
         )
         torch.save(meta_info, origin_module_metadata_ckp)
-
-        graph, forward_args = _gen_graph(
-            module, dummy_forward_args, outdir,
-            constant_folding=compute_config.constant_folding, end2end_mode=compute_config.use_end2end,
-            inference_only=compute_config.inference_only,
-        )
+        graph_start_time = time.time()
+        with wrapnn(module, restore=not is_module_class) as wrapped_module:
+            graph, forward_args = _gen_graph(
+                wrapped_module, dummy_forward_args, outdir,
+                constant_folding=compute_config.constant_folding, end2end_mode=compute_config.use_end2end,
+                inference_only=compute_config.inference_only,
+            )
+        graph_end_time = time.time()
+        print(f'图生成时间：{graph_end_time-graph_start_time}')
         graph.dump(graph_ckp)
         torch.save(forward_args, forward_args_ckp)
 
@@ -757,16 +790,21 @@ def _gencode(
         logger.info(f"Reuse graph dump in {outdir}")
         graph = IRGraph.load(graph_ckp)
         forward_args = torch.load(forward_args_ckp)
-
-    f=open(f'./log/policy_time.txt', mode='a')
-    print('开始求解并行策略',file=f)
-    import time
-    start=time.time()
+    plan_start_time = time.time()
     graph = pas_policy(graph, compute_config)
-    print(f"求解花费时间：{time.time()-start}",file=f)
+    plan_end_time = time.time()
+    print(f'计划生成时间：{plan_end_time-plan_start_time}')
     if not isinstance(graph, IRGraph):
         raise RuntimeError("Expected policy return IRGraph")
 
+    print(graph.sched)
+    f=open("./logs/graph_nodes_full.txt","a")
+
+    temp_tuple = graph.nodes()
+    length = len(temp_tuple)
+    for i in range(0,length):
+        print(f'IRGraph:{temp_tuple[i]}',file=f)
+        f.flush()
     # currently graph.sched is only used for pipeline parallelism
     # so it is not none means we are in pipeline parallelism
     if graph.sched is not None and _contains_uncommutable_data(graph.outputs()):
@@ -786,9 +824,26 @@ def _gencode(
             continue
         if len(node.device) == 0:
             raise RuntimeError(f"Node {node} device is not set")
-        
     # anchor node removed in gener
     graph = IRAdapterGener.gen(graph, cost_fn=None)
+    from datetime import datetime  
+    import os
+    now = datetime.now()
+    date_str=now.strftime("%m-%d")
+    time_str=now.strftime("%H")
+    folder_path = f"./logs/partition/{date_str}/{time_str}/"
+    os.makedirs(folder_path, exist_ok=True)
+    f= open(f"{folder_path}/sub_tensors_map.txt", "w")
+    print(f'\n 开始记录子张量依赖关系',file=f)
+    graph._reorder_producer_consumer()
+    for node in graph.nodes():
+        f= open(f"{folder_path}/sub_tensors_map.txt", "a")
+        print(f'\n subnode {node} is placed on device{node.device}',file=f)
+        for next_nodes in graph.subseq(node):
+            for next_node in next_nodes:
+                print(f'Subsequent node{next_node} is placed on device{next_node.device}',file=f)
+        f.flush() 
+
     if graph.sched is not None:
         graph.sched.apply()
 
@@ -825,7 +880,8 @@ def _gencode(
                 outfile=fname,
                 attach=True
             )
-
+    end_time = time.time()
+    print(f'不含trace的编译时间:{end_time - plan_start_time}')
     return ret
 
 
@@ -864,6 +920,7 @@ def _load_parallel_module_class(
     # parallel_module_class.__module__ = module_class.__module__
     parallel_module_class.__orig_module_class__ = module_class  # save the original module class
     # override train_step and infer_step only if they are defined in the generated module (end2end module only)
+    parallel_module_class.runtime_version = getattr(gen_imported, 'runtime_version', None)
     parallel_module_class._train_step = getattr(gen_imported, '_train_step', parallel_module_class._train_step)
     parallel_module_class._infer_step = getattr(gen_imported, '_infer_step', parallel_module_class._infer_step)
     return parallel_module_class
@@ -1201,8 +1258,8 @@ OptimizerT = TypeVar('OptimizerT', bound=torch.optim.Optimizer)
 
 
 def build_optimizer(
-    module: torch.nn.Module,
-    optimizer_fn: Union[Type[OptimizerT], Callable[..., OptimizerT]],
+    module: torch.nn.Module,#model
+    optimizer_fn: Union[Type[OptimizerT], Callable[..., OptimizerT]],#type
     *args,
     **kwargs,
 ) -> Union[OptimizerT, ParallelOptimizer]:
@@ -1251,6 +1308,8 @@ def build_optimizer(
     non_parallel_module_reducer = None
     non_parallel_modules = [m for m in module.modules() if not isinstance(m, ParallelModule)]
     parallel_modules = [m for m in module.modules() if isinstance(m, ParallelModule)]
+
+    logging.info(f"non_parallel_modules:{non_parallel_modules}\nparallel_modules:{parallel_modules}")
     if not parallel_modules:
         raise RuntimeError("No ParallelModule found in the module. Please make sure you have called parallelize() before build_optimizer().")
 
@@ -1296,7 +1355,6 @@ def build_optimizer(
                 else:
                     opt_module_locs[name].count += 1
             yield param
-
     optimizer: torch.optim.Optimizer = optimizer_fn(_local_parameters(module), *args, **kwargs)
     optimizer._non_parallel_module_reducer = non_parallel_module_reducer
     optimizer._extra_state = OptimizerExtraState(
@@ -1326,7 +1384,8 @@ def build_optimizer(
 
     orig_zero_grad = optimizer.zero_grad
     def _patched_zero_grad(self, set_to_none: bool = True):
-        orig_zero_grad(set_to_none)
+        # orig_zero_grad(set_to_none)
+        orig_zero_grad()
         for m in parallel_modules:
             m.zero_grad()
         if non_parallel_module_reducer:
@@ -1859,6 +1918,8 @@ def _construct_optim_state_zero(
             step, opt_states, opt_state_keys = None, {}, None
             for param in bucket.params:
                 sliced_new_val = _get_optimizer_state_of_param(param, param_ids, local_names)
+                # there are padding in the chunk, so `param.numel()` doesn't work here
+                param_numel = bucket.get_aligned_numel(param)
                 # init the chunk's optimizer state
                 if opt_state_keys is None:
                     opt_state_keys = [key for key in sliced_new_val]
@@ -1875,41 +1936,46 @@ def _construct_optim_state_zero(
 
                 # parameter range: <>
                 # bucket range: []
+                # in the following branches, we check the range including paddings.
+                # but in branch body, we only copy the valid range (without paddings) but update the chunk_offset with paddings.
                 if param_offset < bucket_chunk_start \
-                    and bucket_chunk_start < param_offset + param.numel() < bucket_chunk_end:
+                    and bucket_chunk_start < param_offset + param_numel < bucket_chunk_end:
                     # case: < [ > ]
-                    copy_size = param_offset + param.numel() - bucket_chunk_start
-                    for key in opt_state_keys:
-                        opt_states[key][chunk_offset:chunk_offset+copy_size] = sliced_new_val[key][-copy_size:]
+                    copy_size = param_offset + param_numel - bucket_chunk_start
+                    copy_size_without_padding = param_offset + param.numel() - bucket_chunk_start
+                    if copy_size_without_padding > 0:
+                        for key in opt_state_keys:
+                            opt_states[key][chunk_offset:chunk_offset+copy_size_without_padding] = sliced_new_val[key][-copy_size_without_padding:]
                     chunk_offset += copy_size
                 elif bucket_chunk_start <= param_offset < bucket_chunk_end \
-                    and bucket_chunk_start <= param_offset + param.numel() < bucket_chunk_end:
+                    and bucket_chunk_start <= param_offset + param_numel < bucket_chunk_end:
                     # case: [ <  > ]
                     for key in opt_state_keys:
                         opt_states[key][chunk_offset:chunk_offset+param.numel()] = sliced_new_val[key][:]
-                    chunk_offset += param.numel()
+                    chunk_offset += param_numel
                 elif bucket_chunk_start <= param_offset < bucket_chunk_end \
-                    and param_offset + param.numel() >= bucket_chunk_end:
+                    and param_offset + param_numel >= bucket_chunk_end:
                     # case: [ < ] >
                     copy_size = bucket_chunk_end - param_offset
+                    copy_size_without_padding = min(copy_size, param.numel())
                     for key in opt_state_keys:
-                        opt_states[key][chunk_offset:chunk_offset+copy_size] = sliced_new_val[key][:copy_size]
+                        opt_states[key][chunk_offset:chunk_offset+copy_size_without_padding] = sliced_new_val[key][:copy_size_without_padding]
                     chunk_offset += copy_size
                 elif param_offset < bucket_chunk_start \
-                    and param_offset + param.numel() >= bucket_chunk_end:
+                    and param_offset + param_numel >= bucket_chunk_end:
                     # case: < [ ] >
                     copy_size = bucket_chunk_end - bucket_chunk_start
-                    for key in opt_state_keys:
-                        opt_states[key][chunk_offset:chunk_offset + copy_size] \
-                            = sliced_new_val[key][bucket_chunk_start-param_offset:bucket_chunk_start-param_offset + copy_size]
+                    copy_size_without_padding = min(copy_size, param_offset + param.numel() - bucket_chunk_start)
+                    if copy_size_without_padding > 0:
+                        for key in opt_state_keys:
+                            opt_states[key][chunk_offset:chunk_offset + copy_size_without_padding] \
+                                = sliced_new_val[key][bucket_chunk_start-param_offset:bucket_chunk_start-param_offset + copy_size_without_padding]
                     chunk_offset += copy_size
                 else:
                     # case: [] <>, <> []
-                    logger.debug(f'Skipped: parameter range({param_offset},{param_offset + param.numel()}) vs. bucket range({bucket_chunk_start},{bucket_chunk_end})')
-                param_offset += param.numel()
-            # as there is padding in chunk, slicing to obtain the correct shape opt states
-            for key in opt_state_keys:
-                opt_states[key] = opt_states[key][:opt_param[opt_param_idx].shape[0]]
+                    logger.debug(f'Skipped: parameter range({param_offset},{param_offset + param_numel}) vs. bucket range({bucket_chunk_start},{bucket_chunk_end})')
+                param_offset += param_numel
+
             if step is not None:
                 opt_states['step'] = step
             state_dict[opt_param_idx] = opt_states
@@ -2193,7 +2259,6 @@ def load_deduped_state_dict(
 
         torch.distributed.barrier()
 
-
 def _broadcast_opt_state(optimizer_state_dict, state_indexes: List[int], dedup_group_size: int):
     rank = torch.distributed.get_rank()
     broadcast_group = setup_stride_broadcast_group(dedup_group_size)
@@ -2337,3 +2402,33 @@ def load_sharded_state_dict(
         if optimizer_state_dict is None:
             raise ValueError("optimizer_state_dict should be provided when optimizer is not None.")
         optimizer.load_state_dict(optimizer_state_dict)
+
+
+def sync_grad_when(cond: bool):
+    """
+    Context manager to enable/disable gradient synchronizations across workers.
+
+    Within this context, gradients will be accumulated
+    only when `cond` is True.
+
+    This is needed when
+    1. The mode is not end2end model.
+        For end2end model, gradients are synchronized across workers automatically.
+    2. async is enabled (`compute_config.use_async_reducer` is `True`).
+
+    If both conditions are not satisfied, this function has no effect.
+
+    Example:
+        >>> model = parallelize(model, ...)
+        >>> accum_steps = ...
+        >>> for step in range(accum_steps)
+        >>>     with sync_grad_when(step == accum_steps - 1):
+        >>>         loss = ...
+        >>>         loss.backward()
+        >>> optimizer.step()
+        >>> optimizer.zero_grad()
+
+    Args:
+        cond (bool): whether to synchronize gradients.
+    """
+    return _runtime_flags(skip_reducer=not cond)

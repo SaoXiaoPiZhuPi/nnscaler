@@ -69,7 +69,7 @@ def generate_partitions(
             (('b',), (4,))
     """
     candidates = []
-    for i in range(1, device_num + 1): # i表示选几个维度切
+    for i in range(1, device_num + 1):
         if i > len(dim_ids):
             break
         factors = calc_factors_cached(device_num, i)
@@ -77,10 +77,10 @@ def generate_partitions(
             break
         for factor in factors:
             visited = set()
-            for factor_permutation in itertools.permutations(factor): #(1,16) (2,8) (4,4) (16,1) (8,2)
+            for factor_permutation in itertools.permutations(factor):
                 if factor_permutation not in visited:
                     visited.add(factor_permutation)
-                    for dim_permutation in itertools.permutations(dim_ids, i): #产生所有可能的维度排列，排列选取i个维度 (a,b) (b,a) (a,c) (c,a) (a,b) (b,a)
+                    for dim_permutation in itertools.permutations(dim_ids, i):
                         if -1 in dim_permutation and dim_permutation[0] != -1:
                             continue
                         candidates.append((dim_permutation, factor_permutation))

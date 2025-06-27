@@ -188,6 +188,10 @@ class Executor:
                     dedup_output_tensors,
                     dedup_output_tensor_grads
                 )
+        #qinghe
+        from nnscaler.utils import accum_Manager
+        accum_manager=accum_Manager()
+        accum_manager.step()
 
         torch.autograd.backward(
             dedup_output_tensors,
@@ -206,7 +210,6 @@ class Executor:
         Wait until the finish of synchornized tensors
         """
         return [AsyncCommHandler().wait(t) if torch.is_tensor(t) else t for t in tensors]
-
 
     @staticmethod
     def register_backward_pre_hook(hook: Optional[Callable]):

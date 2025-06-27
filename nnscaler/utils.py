@@ -3,7 +3,10 @@
 
 from contextlib import contextmanager
 from functools import wraps
-from typing import Generator, Optional, Tuple, Callable, List, Set, Any, Iterable, Type, Union
+from typing import (
+    Generator, Optional, Tuple, Callable, Dict, List, Set, Any,
+    Iterable, Type, Union, Protocol, ClassVar, cast, TypeVar
+)
 import logging
 from pathlib import Path
 import sys
@@ -280,6 +283,45 @@ def select_many(data: Iterable[Any], fn: Callable[[Any], Iterable[Any]]) -> Iter
         yield from fn(item)
 
 
+# ref: https://stackoverflow.com/questions/128573/using-property-on-classmethods
+class classproperty(property):
+    """
+    A simple class property decorator.
+    """
+    def __get__(self, obj, objtype=None):
+        # obj will be None when accessed from the class like `MyClass.my_property`
+        return super(classproperty, self).__get__(objtype)
+    # This hack doesn't work for __set__ and __delete__.
+    # so here __set__ and __delete__ are not implemented, and the property is read-only
+
+
+# ref: https://stackoverflow.com/questions/54668000/type-hint-for-an-instance-of-a-non-specific-dataclass
+class IsDataclass(Protocol):
+    # as already noted in comments, checking for this attribute is currently
+    # the most reliable way to ascertain that something is a dataclass
+    __dataclass_fields__: ClassVar[Dict[str, Any]]
+
+
+# ref: https://github.com/pydantic/pydantic/discussions/8600
+@dataclass(frozen=True)
+class _GetFields:
+    _dataclass_type: Type[IsDataclass]
+
+    def __getattr__(self, item: str) -> Any:
+        if item in self._dataclass_type.__dataclass_fields__:
+            return item
+        raise AttributeError(f'"{item}" is not a valid field in type: {self._dataclass_type}')
+
+
+TDataClass = TypeVar("TDataClass", bound=Type[IsDataclass])
+def fields(model: TDataClass, /) -> TDataClass:
+    """
+    This function is used to get the field names(in str) of a dataclass.
+    This is a workaround for the lack of `__name__` of dataclass field.
+    """
+    return cast(TDataClass, _GetFields(model))
+
+
 class accum_mode:
     """Make cube execution in gradient accumulation mode.
 
@@ -377,3 +419,26 @@ class accum_mode:
             RuntimeFlag.skip_reducer = (not (step == nsteps - 1))
             yield step
         RuntimeFlag.skip_zero_grad, RuntimeFlag.skip_reducer = old
+
+class accum_Manager:
+    _instance = None
+
+    def __new__(cls, *args, **kwargs):
+        if cls._instance is None:
+            cls._instance = super(accum_Manager, cls).__new__(cls, *args, **kwargs)
+            cls._instance.nsteps=1
+            cls._instance.now_step=0
+            cls._instance.old=(RuntimeFlag.skip_zero_grad, RuntimeFlag.skip_reducer)
+        return cls._instance
+    
+    def set_nsteps(self,nsteps):
+        self.nsteps=nsteps
+    
+    def step(self):
+        RuntimeFlag.skip_zero_grad = (not (self.now_step == 0))
+        RuntimeFlag.skip_reducer = (not (self.now_step == self.nsteps - 1))
+        self.now_step+=1
+    
+    def reset(self):
+        self.now_step=0
+        RuntimeFlag.skip_zero_grad, RuntimeFlag.skip_reducer = self.old

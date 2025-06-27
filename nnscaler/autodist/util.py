@@ -1,6 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
+import os
 from .descs import NodePartitionDesc
 from nnscaler.graph import IRGraph
 from nnscaler.ir.operator import IRFwOperation
@@ -58,19 +59,11 @@ def replica(graph: IRGraph, node: IRFwOperation, devs: List[int]):
     return sub_nodes
 
 
-def partition_node(node: IRFwOperation, graph: IRGraph, devs: [int],
+def old_partition_node(node: IRFwOperation, graph: IRGraph, devs: List[int],
                    desc: NodePartitionDesc) -> None:
     min_dev_index = min(devs)
     tp_size = len(devs)
     info = desc.desc
-    f= open("./log/allocation.txt", "a")
-    print(f"\npartitioning node {node}",file=f)
-    print(f'node output tensors:{node.oobjs()}',file=f)
-    for out in node.oobjs():
-        next_node=graph.consumers(out.parent)
-        print(f'Subsequent node:{next_node}',file=f)
-    f.flush() 
-    
     dq = deque()
     dq.append((node, (0, tp_size)))
     for (idx, dim), num in info:
@@ -99,3 +92,24 @@ def partition_node(node: IRFwOperation, graph: IRGraph, devs: [int],
         u, (low, high) = dq.popleft()
         assert high - low == 1
         graph.assign(u, low + min_dev_index)
+
+def partition_node(node: IRFwOperation, graph: IRGraph, devs: List[int],
+                   desc: NodePartitionDesc) -> None:
+    info = desc.desc
+    dq = deque()
+    for (idx, dim), num in info:
+        if idx == -1 and dim == -1:
+            sub_nodes = graph.replicate(node, times=num)
+        else:
+            assert idx >= 0 and dim >= 0
+            algo = node.algorithms('dim')
+            sub_nodes = graph.partition(node, algo, idx=idx, dim=dim, num=num)
+
+        assert len(devs) == num ,f'node:{node}, desc:{desc}, len(devs):{len(devs)} info:{(idx, dim), num}'
+        for i, sub_node in enumerate(sub_nodes):
+            dev = devs[i]
+            dq.append((sub_node, dev))
+    
+    while dq:
+        sub_node, dev = dq.popleft()
+        graph.assign(sub_node, dev)

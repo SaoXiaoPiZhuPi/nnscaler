@@ -1,0 +1,34 @@
+{
+  "(1, 131072, 1)-(1, 131072, 1) : torch.float32-torch.float32 : True-True": {
+    "in_mem_info": [
+      524288
+    ],
+    "param_mem_info": [],
+    "buffer_mem_info": [],
+    "fw_span": 0.09485632181167603,
+    "bw_span": 0.12276736088097095,
+    "infer_memory": 1048576,
+    "train_mem_info": [
+      524288
+    ],
+    "train_mem2in_idx": [
+      -1
+    ]
+  },
+  "(1, 8192, 1)-(1, 8192, 1) : torch.float32-torch.float32 : True-True": {
+    "in_mem_info": [
+      32768
+    ],
+    "param_mem_info": [],
+    "buffer_mem_info": [],
+    "fw_span": 0.09624529629945755,
+    "bw_span": 0.11865170672535896,
+    "infer_memory": 65536,
+    "train_mem_info": [
+      32768
+    ],
+    "train_mem2in_idx": [
+      -1
+    ]
+  }
+}

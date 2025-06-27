@@ -16,8 +16,41 @@ from nnscaler.runtime.device import DeviceGroup
 from nnscaler.profiler.timer import CudaTimer
 
 from nnscaler.runtime.executor import AsyncCommHandler
+from nnscaler.runtime.comm_counter import Comm_counter
 
+def move_barr(tensor: Optional[torch.Tensor], shape: Tuple[int], dtype: torch.dtype, src: int, dst: int, async_op=False):
+    """
+    Move a tensor from source device to destination device.
+    """
+    if not async_op:
+        CudaTimer().start(field_name='comm', predefined=True)
+    rank = torch.distributed.get_rank()
+    work = None
+    if rank == src:
+        tensor = tensor.contiguous() if not tensor.is_contiguous() else tensor
+        assert torch.is_tensor(tensor)
 
+        torch.distributed.barrier()
+        if async_op:
+            work = torch.distributed.isend(tensor, dst)
+            
+        else:
+            torch.distributed.send(tensor, dst)
+    else:
+        assert rank == dst
+        tensor = torch.empty(shape, dtype=dtype,
+            device=torch.cuda.current_device()
+        )
+        torch.distributed.barrier()
+        if async_op:
+            work = torch.distributed.irecv(tensor, src)
+            AsyncCommHandler().submit(tensor, [work])
+        else:
+            torch.distributed.recv(tensor, src)
+            
+    if not async_op:
+        CudaTimer().stop(field_name='comm', predefined=True)
+    return tensor
 def move(tensor: Optional[torch.Tensor], shape: Tuple[int], dtype: torch.dtype, src: int, dst: int, async_op=False):
     """
     Move a tensor from source device to destination device.
@@ -57,7 +90,6 @@ def all_reduce(tensor: torch.Tensor,
     tensor = tensor.contiguous() if not tensor.is_contiguous() else tensor
     tensor = tensor.detach().clone()
     group = DeviceGroup().get_group(ranks)
-
     if async_op:
         work = torch.distributed.all_reduce(tensor, group=group, async_op=True)
         AsyncCommHandler().submit(tensor, [work])
@@ -106,10 +138,42 @@ def reduce_scatter(tensor: torch.Tensor, dim: int,
         CudaTimer().stop(field_name='comm', predefined=True)
     return otensor
 
+# def reduce_scatter(tensor: torch.Tensor, dim: int,
+#                    ranks: Tuple[int], async_op=False) -> torch.Tensor:
+#     """ReduceScatter"""
+#     if not async_op:
+#         CudaTimer().start(field_name='comm', predefined=True)
+#     group = DeviceGroup().get_group(ranks)
+#     rank = torch.distributed.get_rank(group=group)
+#     partial_tensor = tensor.chunk(len(ranks), dim=0)[rank]
+#     work = torch.distributed._reduce_scatter_base(partial_tensor, tensor, group=group ,async_op=async_op)
+#     if work:
+#         AsyncCommHandler().submit(partial_tensor, [work])
+#     if not async_op:
+#         CudaTimer().stop(field_name='comm', predefined=True)
+#     return partial_tensor
 
 def all_to_all(tensor: torch.Tensor, idim: int, odim: int,
-               ranks: Tuple[int], async_op=False) -> torch.Tensor:
-    """All-to-all"""
+               ranks: Tuple[int, ...], async_op=False) -> torch.Tensor:
+    """
+    All-to-all (but different with torch.distributed.all_to_all)
+
+    1. Each device will split the tensor into `len(ranks)` chunks on `odim`
+    2. Send each chunk to the corresponding device with `torch.distributed.all_to_all`.
+    3. Concatenate the received chunks on `idim`.
+
+    So the overall work is to change the tensor partitioning from `idim` to `odim`.
+
+    Args:
+        tensor (torch.Tensor): input tensor
+        idim (int): the dimension to concatenate the received chunks
+        odim (int): the dimension to split the tensor
+        ranks (Tuple[int]): the order of split tensor.
+        async_op (bool): whether to use async communication
+
+    Returns:
+        torch.Tensor: the output tensor
+    """
     if not async_op:
         CudaTimer().start(field_name='comm', predefined=True)
     itensors = list(tensor.chunk(len(ranks), dim=odim))
@@ -117,9 +181,7 @@ def all_to_all(tensor: torch.Tensor, idim: int, odim: int,
         itensors[idx] = itensor.contiguous() if not itensor.is_contiguous() else itensor
     otensors = [torch.empty_like(t) for t in itensors]
     group = DeviceGroup().get_group(ranks)
-    # if torch.distributed.get_rank() == 0: print(f'andy: before all_to_all')
     work = torch.distributed.all_to_all(otensors, itensors, group=group, async_op=async_op)
-    # if torch.distributed.get_rank() == 0: print(f'andy: after all_to_all, {work=}')
     if work:
         all2all_callback = lambda t: torch.concat(tuple(otensors), dim=idim)
         AsyncCommHandler().submit(tensor, [work], all2all_callback)
@@ -141,11 +203,11 @@ def all_to_all_single(tensor: torch.Tensor, idim: int, odim: int,
     group = DeviceGroup().get_group(ranks)
     otensor = torch.empty_like(tensor)
     work = torch.distributed.all_to_all_single(otensor, tensor, group=group, async_op=async_op)
-    
+
     def all2all_callback(t):
         t = t.transpose(0, odim) if odim != 0 else t
         return torch.concat(tuple(t.chunk(len(ranks), dim=odim)), dim=idim)
-    
+
     if work:
         AsyncCommHandler().submit(tensor, [work], all2all_callback)
     else:

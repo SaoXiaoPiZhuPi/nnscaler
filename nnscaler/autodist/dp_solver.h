@@ -25,7 +25,6 @@
 #include <unordered_map>
 #include <vector>
 
-//线程池，支持任务的异步执行和线程管理
 class ThreadPool {
 public:
   ThreadPool(unsigned int n = std::thread::hardware_concurrency());
@@ -37,26 +36,26 @@ public:
   unsigned int getProcessed() const { return processed; }
 
 private:
-  std::vector<std::thread> workers; //存储线程池中的工作线程
-  std::deque<std::function<void()>> tasks; //任务队列，存放需要执行的任务
+  std::vector<std::thread> workers;
+  std::deque<std::function<void()>> tasks;
   std::mutex queue_mutex;
-  std::condition_variable cv_task; //条件变量，用于线程同步
+  std::condition_variable cv_task;
   std::condition_variable cv_finished;
-  std::atomic_uint processed; //记录已处理的任务数量
-  unsigned int busy;  //记录忙碌的线程数
-  bool stop; //标志线程池是否停止
+  std::atomic_uint processed;
+  unsigned int busy;
+  bool stop;
 
-  void thread_proc(); //工作线程的处理逻辑
+  void thread_proc();
 };
 
 struct DPNode;
 struct UnitDPState;
 
-struct Node { //计算图中的节点
+struct Node {
   int id;
-  int father_id;  //父节点的id
+  int father_id;
 
-  int cut_len;    //切割的长度
+  int cut_len;
   std::vector<Node *> cut_nodes;
 
   // whether the node is in a recompute region
@@ -68,8 +67,8 @@ struct Node { //计算图中的节点
   // topological sequence of the recompute region
   bool is_recompute_last;
 
-  int p_num; //切分子节点的数量
-  std::vector<double> p_time;  
+  int p_num;
+  std::vector<double> p_time;
   std::vector<int> p_comp_mem;
   std::vector<int> p_in_mem;
   std::vector<int> p_buf_mem;
@@ -83,10 +82,10 @@ struct Node { //计算图中的节点
 
   // assume the number of combinations is less than 2e9
   int dp_num;
-  std::vector<DPNode *> dp_nodes; 
+  std::vector<DPNode *> dp_nodes;
 };
 
-struct DPNode { //动态规划中节点的状态和信息，处理计算图中的内存和时间优化
+struct DPNode {
   Node *graph_node;
   // pg_id: partition group id, an equivalent representation of `ir`
   int pg_id;
@@ -107,7 +106,7 @@ struct SearchPlan {
   }
 };
 
-struct UnitDPState { //单个动态规划状态的内存和时间消耗信息
+struct UnitDPState {
   int param_related_mem;
   int activation_mem;
   int opt_transient_mem;

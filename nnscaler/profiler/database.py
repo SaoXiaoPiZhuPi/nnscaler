@@ -12,7 +12,6 @@ import os
 import copy
 import json
 import math
-import sys
 import logging
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -151,11 +150,15 @@ def profile(node: IRFwOperation, func: Callable, shapes: Shapes, dtypes: DTypes,
         constructor = torch.zeros if dtype in (torch.int64, torch.int32, torch.bool) else torch.rand
         return constructor(tuple(shape), dtype=dtype, device=torch.cuda.current_device(), requires_grad=requires_grad)
 
-    tensors = tuple(
-        gen_torch_tensors(shape, dtype, requires_grad) if isinstance(value, IRTensor) else value \
-            for shape, dtype, requires_grad, value in zip(shapes, dtypes, requires_grads, values)
-    )
-
+    if CustomizedOps.kOpInputGen.get(node.signature, None) is not None:
+        in_tensors = CustomizedOps.kOpInputGen[node.signature](node)
+    else:
+        in_tensors = tuple(
+            gen_torch_tensors(shape, dtype, requires_grad) if isinstance(value, IRTensor) else value \
+                for shape, dtype, requires_grad, value in zip(shapes, dtypes, requires_grads, values)
+        )
+    # add clone() to avoid error "RuntimeError: a view of a leaf Variable that requires grad is being used in an in-place operation."
+    tensors = tuple([t.clone() if torch.is_tensor(t) else t for t in in_tensors])
     total_input_size = sum(t.numel() * t.element_size() for t in tensors if torch.is_tensor(t))
     require_backward = any([t.requires_grad for t in tensors if hasattr(t, 'requires_grad')])
     # FIXME: reconsidering requires_grad
@@ -173,12 +176,15 @@ def profile(node: IRFwOperation, func: Callable, shapes: Shapes, dtypes: DTypes,
         train_kwargs[name] = train_val
         eval_kwargs[name] = eval_val
 
-    f = open(f'./log/profile_log_noderank{os.getenv("NODE_RANK")}_rank{torch.cuda.current_device()}.txt', 'a')
-    print(f'profile节点{node}',file=f)
-    print(f'是否需要后向{require_backward}',file=f)
-    print(f'node.signature:{node.signature},输入张量大小：{total_input_size/(1024*1024)}MB,输入张量形状：{shapes}',file=f)
     # run one sample
     outputs = func(*tensors, **train_kwargs)
+
+    # check whether func is a in-place operation
+    for t1, t2 in zip(in_tensors, tensors):
+        if torch.is_tensor(t1) and not torch.equal(t1, t2):
+            _logger.warning(f"{node}: in-place operation detected, the input tensor is modified, will not profile backward")
+            require_backward = False
+
     # only profile IRDimops currently, which has at least one tensor output and
     # may have non-tensor outputs (like list, tuple, dict, etc.). In addition,
     # we assume that non-tensor outputs will not be used in backward.
@@ -186,16 +192,13 @@ def profile(node: IRFwOperation, func: Callable, shapes: Shapes, dtypes: DTypes,
     outputs = tuple(filter(lambda x: torch.is_tensor(x) and x.requires_grad, outputs))
     assert all(torch.is_tensor(otensor) for otensor in outputs), \
         f"{func.__name__}: require all the outputs to be tensors"
-    
     grads = tuple(torch.zeros_like(otensor) for otensor in outputs)
-    del outputs
 
     def run_step(func, tensors, kwargs, backward: bool):
         outputs = func(*tensors, **kwargs)
         outputs = (outputs,) if torch.is_tensor(outputs) else outputs
         outputs = tuple(filter(lambda x: torch.is_tensor(x) and x.requires_grad, outputs))
         if backward:
-            # grads = tuple(torch.zeros_like(otensor) for otensor in outputs)
             torch.autograd.backward(outputs, grads)
         return outputs
 
@@ -204,12 +207,9 @@ def profile(node: IRFwOperation, func: Callable, shapes: Shapes, dtypes: DTypes,
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     mtic = torch.cuda.max_memory_allocated()  # in bytes
-
     with torch.no_grad():
         run_step(func, tensors, eval_kwargs, backward=False)
     mtoc = torch.cuda.max_memory_allocated()  # in bytes
-    
-    print(f'inference,测量前内存占用：{mtic/(1024*1024)}MB,峰值占用:{mtoc/(1024*1024)}MB',file=f)
     infer_memory = mtoc - mtic + total_input_size
 
     train_mem_info = []
@@ -244,7 +244,7 @@ def profile(node: IRFwOperation, func: Callable, shapes: Shapes, dtypes: DTypes,
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     with torch.autograd.graph.saved_tensors_hooks(pack_hook, unpack_hook):
-        run_step(func, tensors, train_kwargs, backward=require_backward)
+        outs = run_step(func, tensors, train_kwargs, backward=require_backward)
 
     # warmup
     warmup_cnt = 0
@@ -256,12 +256,6 @@ def profile(node: IRFwOperation, func: Callable, shapes: Shapes, dtypes: DTypes,
     toc = time.perf_counter()
     func_duration = (toc - tic) / warmup_cnt
     real_prof_times = max(1, min(prof_times, math.ceil(max_prof_sec / func_duration)))
-    
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
-    mtic = torch.cuda.max_memory_allocated()  # in bytes
-    print(f'前向计算前的内存占用：{mtic/(1024*1024)}MB',file=f)
 
     # profile forward only
     torch.cuda.synchronize()
@@ -271,13 +265,8 @@ def profile(node: IRFwOperation, func: Callable, shapes: Shapes, dtypes: DTypes,
             run_step(func, tensors, eval_kwargs, backward=False)
     torch.cuda.synchronize()
     toc = time.perf_counter()
-    fw_span =(toc-tic) / real_prof_times * 1000 # in milliseconds
-    mtoc = torch.cuda.max_memory_allocated()  # in bytes
-    print(f'前向时的最大内存占用 {mtoc/(1024*1024)}MB,测量时间消耗：{fw_span}微秒',file=f)
+    fw_span = (toc - tic) / real_prof_times * 1000 # in milliseconds
 
-    torch.cuda.reset_peak_memory_stats()
-    mtic = torch.cuda.max_memory_allocated()  # in bytes
-    print(f'后向前的最大内存占用 {mtic/(1024*1024)}MB',file=f)
     # profile forward + backward
     torch.cuda.synchronize()
     tic = time.perf_counter()
@@ -285,15 +274,8 @@ def profile(node: IRFwOperation, func: Callable, shapes: Shapes, dtypes: DTypes,
         run_step(func, tensors, train_kwargs, backward=require_backward)
     torch.cuda.synchronize()
     toc = time.perf_counter()
-    fwbw_span = (toc-tic) / real_prof_times * 1000 # in milliseconds
+    fwbw_span = (toc - tic) / real_prof_times * 1000 # in milliseconds
     bw_span = max(fwbw_span - fw_span, 0.0)
-    mtoc = torch.cuda.max_memory_allocated()  # in bytes
-    print(f'后向时的最大内存占用 {mtoc/(1024*1024)}MB,测量时间消耗：{bw_span}微秒',file=f)
-
-
-    f.close()
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
 
     return fw_span, bw_span, infer_memory, train_mem_info, train_mem2in_idx
 
@@ -307,7 +289,6 @@ class ProfileDataBase:
 
         self._data: Dict[str, Dict[str, Tuple[float, float, int]]] = dict()
         if filename is not None:
-            print("存储profile data的文件",filename)
             self.load(filename)
 
     def profile(self, node: IRFwOperation, override: bool = False) -> ProfiledMetrics:
@@ -321,8 +302,8 @@ class ProfileDataBase:
         Returns:
             profiled_metrics ProfiledMetrics: the profiling data
         """
-        # if not override and self.exist(node):
-        #     return self.query(node)
+        if not override and self.exist(node):
+            return self.query(node)
 
         fn, shapes, dtypes, requires_grads, values, kwargs = get_func(node)
         
