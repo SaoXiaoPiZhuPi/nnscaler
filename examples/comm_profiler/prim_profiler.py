@@ -41,7 +41,8 @@ def main():
     logger.info(f'CUDA device num: {torch.cuda.device_count()}')
     profiler_fname = Path(__file__).parent / 'comm_profile.py'
     device_num = 2
-    while device_num <= torch.cuda.device_count():
+    # while device_num <= torch.cuda.device_count():
+    while device_num <= 2:
         command = f'torchrun --master_port 21212 --nproc_per_node={device_num} {profiler_fname} --comm_profile_dir={comm_path}'
         output = subprocess.check_output(command, shell=True, text=True)
         device_num = device_num * 2

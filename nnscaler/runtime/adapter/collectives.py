@@ -40,7 +40,7 @@ def move_barr(tensor: Optional[torch.Tensor], shape: Tuple[int], dtype: torch.dt
         tensor_size *= torch.tensor([], dtype=dtype).element_size()
     
     if not async_op:
-        CudaTimer().start(field_name='move_barr', predefined=True, comm_ranks=[src, dst], comm_size=tensor_size)
+        CudaTimer().start(field_name='move barr', predefined=True, comm_ranks=[src, dst], comm_size=tensor_size)
     rank = torch.distributed.get_rank()
     work = None
     if rank == src:
@@ -66,7 +66,7 @@ def move_barr(tensor: Optional[torch.Tensor], shape: Tuple[int], dtype: torch.dt
             torch.distributed.recv(tensor, src)
             
     if not async_op:
-        CudaTimer().stop(field_name='move_barr', predefined=True)
+        CudaTimer().stop(field_name='move barr', predefined=True)
     return tensor
 
 
@@ -115,7 +115,7 @@ def all_reduce(tensor: torch.Tensor,
     """Allreduce"""
     tensor_size = _get_tensor_size(tensor)
     if not async_op:
-        CudaTimer().start(field_name='all_reduce', predefined=True, comm_ranks=ranks, comm_size=tensor_size)
+        CudaTimer().start(field_name='all reduce', predefined=True, comm_ranks=ranks, comm_size=tensor_size)
     tensor = tensor.contiguous() if not tensor.is_contiguous() else tensor
     tensor = tensor.detach().clone()
     group = DeviceGroup().get_group(ranks)
@@ -125,7 +125,7 @@ def all_reduce(tensor: torch.Tensor,
     else:
         torch.distributed.all_reduce(tensor, group=group)
     if not async_op:
-        CudaTimer().stop(field_name='all_reduce', predefined=True)
+        CudaTimer().stop(field_name='all reduce', predefined=True)
     return tensor
 
 
@@ -134,7 +134,7 @@ def all_gather(tensor: torch.Tensor, dim: int,
     """Allgather"""
     tensor_size = _get_tensor_size(tensor)
     if not async_op:
-        CudaTimer().start(field_name='all_gather', predefined=True, comm_ranks=list(ranks), comm_size=tensor_size)
+        CudaTimer().start(field_name='all gather', predefined=True, comm_ranks=list(ranks), comm_size=tensor_size)
     tensor = tensor.contiguous() if not tensor.is_contiguous() else tensor
     group = DeviceGroup().get_group(ranks)
     tensor_list = [torch.empty_like(tensor) for _ in ranks]
@@ -147,7 +147,7 @@ def all_gather(tensor: torch.Tensor, dim: int,
     else:
         otensor = torch.concat(tuple(tensor_list), dim=dim)
     if not async_op:
-        CudaTimer().stop(field_name='all_gather', predefined=True)
+        CudaTimer().stop(field_name='all gather', predefined=True)
     return otensor
 
 
@@ -156,7 +156,7 @@ def reduce_scatter(tensor: torch.Tensor, dim: int,
     """ReduceScatter"""
     tensor_size = _get_tensor_size(tensor)
     if not async_op:
-        CudaTimer().start(field_name='reduce_scatter', predefined=True, comm_ranks=list(ranks), comm_size=tensor_size)
+        CudaTimer().start(field_name='reduce scatter', predefined=True, comm_ranks=list(ranks), comm_size=tensor_size)
     itensors = list(tensor.chunk(len(ranks), dim))
     for idx, t in enumerate(itensors):
         itensors[idx] = t.contiguous() if not t.is_contiguous() else t
@@ -166,7 +166,7 @@ def reduce_scatter(tensor: torch.Tensor, dim: int,
     if work:
         AsyncCommHandler().submit(otensor, [work])
     if not async_op:
-        CudaTimer().stop(field_name='reduce_scatter', predefined=True)
+        CudaTimer().stop(field_name='reduce scatter', predefined=True)
     return otensor
 
 
@@ -193,7 +193,7 @@ def all_to_all(tensor: torch.Tensor, idim: int, odim: int,
     """
     tensor_size = _get_tensor_size(tensor)
     if not async_op:
-        CudaTimer().start(field_name='all_to_all', predefined=True, comm_ranks=list(ranks), comm_size=tensor_size)
+        CudaTimer().start(field_name='all to all', predefined=True, comm_ranks=list(ranks), comm_size=tensor_size)
     itensors = list(tensor.chunk(len(ranks), dim=odim))
     for idx, itensor in enumerate(itensors):
         itensors[idx] = itensor.contiguous() if not itensor.is_contiguous() else itensor
@@ -207,7 +207,7 @@ def all_to_all(tensor: torch.Tensor, idim: int, odim: int,
     else:
         otensor = torch.concat(tuple(otensors), dim=idim)
     if not async_op:
-        CudaTimer().stop(field_name='all_to_all', predefined=True)
+        CudaTimer().stop(field_name='all to all', predefined=True)
     return otensor
 
 
@@ -216,7 +216,7 @@ def all_to_all_single(tensor: torch.Tensor, idim: int, odim: int,
     """All-to-all for single tensor"""
     tensor_size = _get_tensor_size(tensor)
     if not async_op:
-        CudaTimer().start(field_name='all_to_all_single', predefined=True, comm_ranks=list(ranks), comm_size=tensor_size)
+        CudaTimer().start(field_name='all to all', predefined=True, comm_ranks=list(ranks), comm_size=tensor_size)
     tensor = tensor.transpose(0, odim) if odim != 0 else tensor
     tensor = tensor.contiguous() if not tensor.is_contiguous() else tensor
     group = DeviceGroup().get_group(ranks)
@@ -233,7 +233,7 @@ def all_to_all_single(tensor: torch.Tensor, idim: int, odim: int,
         otensor = all2all_callback(otensor)
 
     if not async_op:
-        CudaTimer().stop(field_name='all_to_all_single', predefined=True)
+        CudaTimer().stop(field_name='all to all', predefined=True)
     return otensor
 
 

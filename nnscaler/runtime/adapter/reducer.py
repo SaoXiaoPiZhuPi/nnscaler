@@ -161,27 +161,27 @@ class Bucket:
             # number of zero groups is 1, thus only reduce scatter is enough
             # in this case, self._group == self._zero_subgroup
             ranks = [torch.distributed.get_rank(group=self._zero_subgroup) for _ in range(self._zgroup_sz)]
-            CudaTimer().start(field_name='reduce_scatter', predefined=True, comm_ranks=ranks, comm_size=tensor_size)
+            CudaTimer().start(field_name='reduce scatter', predefined=True, comm_ranks=ranks, comm_size=tensor_size)
             torch.distributed.reduce_scatter_tensor(
                 partial_tensor, self._contiguous_grads,
                 op=self._reduce_op, group=self._zero_subgroup)
-            CudaTimer().stop(field_name='reduce_scatter', predefined=True)
+            CudaTimer().stop(field_name='reduce scatter', predefined=True)
         else:
             # two steps for group reduce scatter
             # step #1, allreduce across corresponding GPUs across groups
             cross_ranks = [torch.distributed.get_rank(group=self._zero_crossgroup) for _ in range(torch.distributed.get_world_size(group=self._zero_crossgroup))]
-            CudaTimer().start(field_name='all_reduce', predefined=True, comm_ranks=cross_ranks, comm_size=tensor_size)
+            CudaTimer().start(field_name='all reduce', predefined=True, comm_ranks=cross_ranks, comm_size=tensor_size)
             torch.distributed.all_reduce(
                 self._contiguous_grads, op=self._reduce_op, group=self._zero_crossgroup)
-            CudaTimer().stop(field_name='all_reduce', predefined=True)
+            CudaTimer().stop(field_name='all reduce', predefined=True)
             # step #2, reduce scatter within each group
             ranks = [torch.distributed.get_rank(group=self._zero_subgroup) for _ in range(self._zgroup_sz)]
             partial_size = partial_tensor.numel() * partial_tensor.element_size()
-            CudaTimer().start(field_name='reduce_scatter', predefined=True, comm_ranks=ranks, comm_size=partial_size)
+            CudaTimer().start(field_name='reduce scatter', predefined=True, comm_ranks=ranks, comm_size=partial_size)
             torch.distributed.reduce_scatter_tensor(
                 partial_tensor, self._contiguous_grads,
                 op=self._reduce_op, group=self._zero_subgroup)
-            CudaTimer().stop(field_name='reduce_scatter', predefined=True)
+            CudaTimer().stop(field_name='reduce scatter', predefined=True)
 
     def build(self):
         """
@@ -294,9 +294,9 @@ class Bucket:
                 # non-zero mode: all_reduce
                 tensor_size = self._contiguous_grads.numel() * self._contiguous_grads.element_size()
                 ranks = list(range(torch.distributed.get_world_size(group=self._group)))
-                CudaTimer().start(field_name='all_reduce', predefined=True, comm_ranks=ranks, comm_size=tensor_size)
+                CudaTimer().start(field_name='all reduce', predefined=True, comm_ranks=ranks, comm_size=tensor_size)
                 torch.distributed.all_reduce(self._contiguous_grads, op=self._reduce_op, group=self._group)
-                CudaTimer().stop(field_name='all_reduce', predefined=True)
+                CudaTimer().stop(field_name='all reduce', predefined=True)
         # grads = self._contiguous_grads.clone()
         for param in self._params:
             assert param.grad is None
@@ -323,9 +323,9 @@ class Bucket:
         src_tensor = self._contiguous_params.chunk(self._zgroup_sz, dim=0)[rank]
         tensor_size = self._contiguous_params.numel() * self._contiguous_params.element_size()
         ranks = [torch.distributed.get_rank(group=self._zero_subgroup) for _ in range(self._zgroup_sz)]
-        CudaTimer().start(field_name='all_gather', predefined=True, comm_ranks=ranks, comm_size=tensor_size)
+        CudaTimer().start(field_name='all_gather_into_tensor', predefined=True, comm_ranks=ranks, comm_size=tensor_size)
         torch.distributed.all_gather_into_tensor(self._contiguous_params, src_tensor, group=self._zero_subgroup)
-        CudaTimer().stop(field_name='all_gather', predefined=True)
+        CudaTimer().stop(field_name='all_gather_into_tensor', predefined=True)
 
     def register_pre_hook(self, fn: Callable):
         """Register pre hooks to be applied before gradient synchronization.

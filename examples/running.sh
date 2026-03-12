@@ -14,7 +14,7 @@ mkdir -p ${PROFILE_OUTPUT}
 data=$(cat running.conf)
 declare $data
 for PLAN_NGPUS in 4;do
-    export LOG_NAME=${PROFILE_OUTPUT}/${MTIME}.dp_size_$((${RUNTIME_NGPUS} / ${PLAN_NGPUS}))_${NAME}_${PLAN_NGPUS}.log
+    export LOG_NAME=${PROFILE_OUTPUT}/${MTIME}.dp_size_$((${RUNTIME_NGPUS}/${PLAN_NGPUS}))_${NAME}_${PLAN_NGPUS}.log
     if [ $# -le 1 ]; then
         echo "Node rank & Master Addr are not provided. Run on local single machine."
         if [ "$PIPLINE" == "True" ]; then

@@ -28,8 +28,8 @@ class CommProfiler:
     def collect_profile_info(self,
                              primitive: str) -> Tuple[List[float], List[float]]:
 
-        b_size = 16
-        sequence_len = 16
+        b_size = 1
+        sequence_len = 4096
         element_size=4
         sizes_in_mb=[0.25,0.5,1,2,4,8,16,32,64,128,256,512,1024,2048]
         
@@ -88,7 +88,7 @@ class CommProfiler:
                 for _ in range(self.profile_times):
                     otensor = func(**kwargs)
                 # if torch.distributed.get_rank() == 0: print(f'{d_size}_3')
-                cur_t = CudaTimer().instance.field_data['comm'] / self.profile_times
+                cur_t = CudaTimer().instance.field_data[primitive] / self.profile_times
                 times_in_s.append(cur_t)
         return sizes_in_mb, times_in_s
 
@@ -100,7 +100,7 @@ class CommProfiler:
         b_size = 16
         sequence_len = 16
         element_size=4
-        sizes_in_mb=[0.25,0.5,1,2,4,8,16,32,64,128,256,512,1024,2048]
+        sizes_in_mb=[0.25,0.5,1,2,4,8,16,32,64,128,256,512,1024,2048, 4096, 8192]
         model_dim_list = [
             int(mem * 1024 * 1024 //element_size // b_size // sequence_len)
             for mem in sizes_in_mb
@@ -157,7 +157,7 @@ class CommProfiler:
                 for _ in range(self.profile_times):
                     otensor = func(**kwargs)
                 # if torch.distributed.get_rank() == 0: print(f'{d_size}_3')
-                cur_t = CudaTimer().instance.field_data['comm'] / self.profile_times
+                cur_t = CudaTimer().instance.field_data[primitive] / self.profile_times
                 times_in_s.append(cur_t)
         return sizes_in_mb, times_in_s
 
@@ -175,7 +175,7 @@ class CommProfiler:
     def profile_inter_node(self) -> Dict[str, Tuple[List[float], List[float]]]:
         profile_info = {}
         for primitive in [
-                'all gather', 'all reduce', 'reduce scatter', 'move'
+                'all gather', 'all reduce', 'reduce scatter', 'all to all', 'move'
         ]:
         # for primitive in [
         #         'all reduce'
